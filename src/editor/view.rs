@@ -315,6 +315,8 @@ pub enum VimMode {
     Insert,
     Visual,
     VisualLine,
+    /// Columnar selection: the same byte-column range on each covered line.
+    VisualBlock,
 }
 
 impl EventEmitter<EditorEvent> for Editor {}
@@ -2362,6 +2364,33 @@ impl Editor {
         self.changed(window, cx);
     }
 
+    fn on_vim_visual_block(&mut self, _: &k::VimVisualBlock, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.guard(window, cx) { return; }
+        if self.vim_mode == VimMode::VisualBlock {
+            self.vim_to_normal();
+        } else {
+            // Start a columnar selection from the caret (Select* motions grow it,
+            // reinterpreted as a rectangle by the render / columnar ops).
+            self.core.clear_block_sel();
+            self.vim_mode = VimMode::VisualBlock;
+        }
+        self.changed(window, cx);
+    }
+
+    fn on_vim_visual_block_delete(&mut self, _: &k::VimVisualBlockDelete, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.guard(window, cx) { return; }
+        self.core.delete_columns();
+        self.vim_mode = VimMode::Normal;
+        self.changed(window, cx);
+    }
+
+    fn on_vim_visual_block_yank(&mut self, _: &k::VimVisualBlockYank, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.guard(window, cx) { return; }
+        cx.write_to_clipboard(ClipboardItem::new_string(self.core.columns_text()));
+        self.vim_to_normal();
+        self.changed(window, cx);
+    }
+
     fn on_vim_visual_delete(&mut self, _: &k::VimVisualDelete, window: &mut Window, cx: &mut Context<Self>) {
         if !self.guard(window, cx) { return; }
         // `on_delete` deletes the block selection in Visual Line, else the
@@ -2927,8 +2956,11 @@ impl Editor {
             .on_action(guard(cx, Self::on_vim_yank_line))
             .on_action(guard(cx, Self::on_vim_visual))
             .on_action(guard(cx, Self::on_vim_visual_line))
+            .on_action(guard(cx, Self::on_vim_visual_block))
             .on_action(guard(cx, Self::on_vim_visual_delete))
             .on_action(guard(cx, Self::on_vim_visual_yank))
+            .on_action(guard(cx, Self::on_vim_visual_block_delete))
+            .on_action(guard(cx, Self::on_vim_visual_block_yank))
             .on_action(guard(cx, Self::on_select_all))
             .on_action(guard(cx, Self::on_copy))
             .on_action(guard(cx, Self::on_copy_markdown))

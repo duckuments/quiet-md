@@ -239,7 +239,14 @@ impl R<'_> {
         let bm = core.in_block_mode() || self.ghost;
         let sel = core.sel;
         spec.link_underline = !bm && self.focused && sel.head.block == id;
-        let selection = if bm || sel.is_collapsed() { None } else { core.range_in(id, &self.units) };
+        let selection = if self.ed.vim_mode == super::view::VimMode::VisualBlock {
+            // Columnar: the same byte-column range on each covered line.
+            core.col_range_in(id, &self.units)
+        } else if bm || sel.is_collapsed() {
+            None
+        } else {
+            core.range_in(id, &self.units)
+        };
         let caret_here = !bm && core.cell_sel.is_none() && sel.head.block == id && sel.is_collapsed();
         RichTextElement {
             id,
@@ -1601,8 +1608,14 @@ impl Editor {
         let ctx = if read_only { "EditorRO".to_string() } else if crate::settings::vim() {
             use super::view::VimMode;
             // Visual Line shares the charwise Visual key bindings (the motion
-            // and operator handlers branch on the block selection themselves).
-            let m = match self.vim_mode { VimMode::Normal => "normal", VimMode::Insert => "insert", VimMode::Visual | VimMode::VisualLine => "visual" };
+            // and operator handlers branch on the block selection themselves);
+            // Visual Block has its own columnar bindings.
+            let m = match self.vim_mode {
+                VimMode::Normal => "normal",
+                VimMode::Insert => "insert",
+                VimMode::Visual | VimMode::VisualLine => "visual",
+                VimMode::VisualBlock => "visualblock",
+            };
             format!("Editor vim = {m}")
         } else { "Editor".to_string() };
         let root = div()

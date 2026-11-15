@@ -60,6 +60,16 @@ pub struct Unit {
 
 // ------------------------------------------------------------------ tree access
 
+/// Largest char boundary `<= i` (and `<= s.len()`), so byte columns taken from
+/// one line never split a multi-byte char on another.
+fn floor_boundary(s: &str, i: usize) -> usize {
+    let mut i = i.min(s.len());
+    while i > 0 && !s.is_char_boundary(i) {
+        i -= 1;
+    }
+    i
+}
+
 pub fn find_path(blocks: &[Block], id: BlockId) -> Option<Path> {
     for (i, b) in blocks.iter().enumerate() {
         if b.id == id {
@@ -565,6 +575,71 @@ impl Core {
         let a = if i == si { s.offset } else { 0 };
         let b = if i == ei { e.offset } else { len };
         Some(a..b)
+    }
+
+    /// Visual Block column range within block `id`: the same byte-column span
+    /// `[c0,c1)` on every covered line, clamped to the line and to char
+    /// boundaries. `None` if `id` is outside the rectangle or not text.
+    pub fn col_range_in(&self, id: BlockId, units: &[Unit]) -> Option<Range<usize>> {
+        let (s, e) = self.ordered_in(units);
+        let si = self.unit_index(units, s.block)?;
+        let ei = self.unit_index(units, e.block)?;
+        let i = self.unit_index(units, id)?;
+        if i < si || i > ei || !units[i].text {
+            return None;
+        }
+        let (c0, c1) = (s.offset.min(e.offset), s.offset.max(e.offset));
+        let t = self.text_of(id)?;
+        Some(floor_boundary(&t.text, c0)..floor_boundary(&t.text, c1))
+    }
+
+    /// Delete the Visual Block rectangle: the column range on each covered
+    /// line. Lines shorter than the column are left as-is.
+    pub fn delete_columns(&mut self) {
+        let units = self.units();
+        let (s, e) = self.ordered_in(&units);
+        let (Some(si), Some(ei)) = (self.unit_index(&units, s.block), self.unit_index(&units, e.block)) else { return; };
+        let (c0, c1) = (s.offset.min(e.offset), s.offset.max(e.offset));
+        // Checkpoint only once an actual edit happens, so a zero-width rectangle
+        // (vertical-only selection) leaves no empty undo step and no dirty flag.
+        let mut edited = false;
+        for u in &units[si..=ei] {
+            if !u.text {
+                continue;
+            }
+            let (a, b) = match self.text_of(u.id) {
+                Some(t) => (floor_boundary(&t.text, c0), floor_boundary(&t.text, c1)),
+                None => continue,
+            };
+            if a >= b {
+                continue;
+            }
+            if !edited {
+                self.checkpoint(EditKind::Delete);
+                edited = true;
+            }
+            if let Some(t) = self.text_mut(u.id) {
+                t.replace(a..b, &RichText::default());
+            }
+        }
+        if edited {
+            self.normalize();
+        }
+        let col = self.text_of(s.block).map_or(0, |t| floor_boundary(&t.text, c0));
+        self.sel = Selection::caret(Pos::new(s.block, col));
+        self.fix_selection();
+    }
+
+    /// The Visual Block rectangle as plain text, one line per covered block.
+    pub fn columns_text(&self) -> String {
+        let units = self.units();
+        let (s, e) = self.ordered_in(&units);
+        let (Some(si), Some(ei)) = (self.unit_index(&units, s.block), self.unit_index(&units, e.block)) else { return String::new(); };
+        let (c0, c1) = (s.offset.min(e.offset), s.offset.max(e.offset));
+        units[si..=ei].iter().map(|u| match self.text_of(u.id) {
+            Some(t) if u.text => t.text[floor_boundary(&t.text, c0)..floor_boundary(&t.text, c1)].to_string(),
+            _ => String::new(),
+        }).collect::<Vec<_>>().join("\n")
     }
 
     /// Atomic blocks fully covered by the selection (rendered as selected).

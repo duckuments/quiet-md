@@ -88,8 +88,11 @@ actions!(
         VimYankLine,     // yy
         VimVisual,       // v (toggle charwise Visual)
         VimVisualLine,   // V (toggle line-wise Visual)
+        VimVisualBlock,  // ctrl-v (toggle block-wise Visual)
         VimVisualDelete, // d / x in Visual
         VimVisualYank,   // y in Visual
+        VimVisualBlockDelete, // d / x in Visual Block
+        VimVisualBlockYank,   // y in Visual Block
     ]
 );
 
@@ -231,6 +234,9 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("u", Undo, vn),
         KeyBinding::new("v", VimVisual, vn),
         KeyBinding::new("shift-v", VimVisualLine, vn),
+        // ctrl-v (cmd-v, PC-mapped to ctrl-v) enters Visual Block; in Insert or
+        // with Vim off it falls through to the Editor binding and pastes.
+        KeyBinding::new("cmd-v", VimVisualBlock, vn),
     ]);
 
     // Vim Visual mode: motions extend the selection; d/y act on it then exit.
@@ -252,5 +258,26 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("y", VimVisualYank, vv),
         KeyBinding::new("v", VimVisual, vv),
         KeyBinding::new("shift-v", VimVisualLine, vv),
+        KeyBinding::new("cmd-v", VimVisualBlock, vv),
+    ]);
+
+    // Vim Visual Block: motions grow a columnar selection; d/y act on the
+    // rectangle. The paste shortcut (ctrl-v) toggles the mode back off.
+    let vb = Some("Editor && vim == visualblock");
+    cx.bind_keys([
+        KeyBinding::new("h", SelectLeft, vb),
+        KeyBinding::new("l", SelectRight, vb),
+        KeyBinding::new("j", SelectDown, vb),
+        KeyBinding::new("k", SelectUp, vb),
+        KeyBinding::new("w", SelectWordRight, vb),
+        KeyBinding::new("b", SelectWordLeft, vb),
+        KeyBinding::new("0", SelectLineStart, vb),
+        KeyBinding::new("$", SelectLineEnd, vb),
+        KeyBinding::new("d", VimVisualBlockDelete, vb),
+        KeyBinding::new("x", VimVisualBlockDelete, vb),
+        KeyBinding::new("y", VimVisualBlockYank, vb),
+        KeyBinding::new("v", VimVisual, vb),
+        KeyBinding::new("shift-v", VimVisualLine, vb),
+        KeyBinding::new("cmd-v", VimVisualBlock, vb),
     ]);
 }
