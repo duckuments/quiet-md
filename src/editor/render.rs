@@ -1599,7 +1599,10 @@ impl Editor {
         // Vim mode layers a `vim = normal|insert|visual` attribute onto the
         // Editor context so Normal-mode letter bindings (keymap.rs) can match.
         let ctx = if read_only { "EditorRO".to_string() } else if crate::settings::vim() {
-            let m = match self.vim_mode { super::view::VimMode::Normal => "normal", super::view::VimMode::Insert => "insert", super::view::VimMode::Visual => "visual" };
+            use super::view::VimMode;
+            // Visual Line shares the charwise Visual key bindings (the motion
+            // and operator handlers branch on the block selection themselves).
+            let m = match self.vim_mode { VimMode::Normal => "normal", VimMode::Insert => "insert", VimMode::Visual | VimMode::VisualLine => "visual" };
             format!("Editor vim = {m}")
         } else { "Editor".to_string() };
         let root = div()

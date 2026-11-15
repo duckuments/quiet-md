@@ -307,12 +307,14 @@ pub struct Editor {
 }
 
 /// Vim mode. In Normal/Visual the caret is a block and letters are commands;
-/// in Insert text is typed as usual.
+/// in Insert text is typed as usual. `VisualLine` is charwise Visual's
+/// line-wise sibling, backed by the editor's whole-block selection.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum VimMode {
     Normal,
     Insert,
     Visual,
+    VisualLine,
 }
 
 impl EventEmitter<EditorEvent> for Editor {}
@@ -2326,28 +2328,52 @@ impl Editor {
         self.changed(window, cx);
     }
 
+    /// Return to Normal, clearing any Visual selection — both the whole-block
+    /// one (Visual Line) and the charwise caret range.
+    fn vim_to_normal(&mut self) {
+        self.vim_mode = VimMode::Normal;
+        self.core.clear_block_sel();
+        self.core.sel = Selection::caret(self.core.sel.head);
+    }
+
     fn on_vim_visual(&mut self, _: &k::VimVisual, window: &mut Window, cx: &mut Context<Self>) {
         if !self.guard(window, cx) { return; }
         if self.vim_mode == VimMode::Visual {
-            self.vim_mode = VimMode::Normal;
-            self.core.sel = Selection::caret(self.core.sel.head);
+            self.vim_to_normal();
         } else {
+            // Normal or Visual Line → charwise Visual (drop any block selection).
+            self.core.clear_block_sel();
             self.vim_mode = VimMode::Visual;
+        }
+        self.changed(window, cx);
+    }
+
+    fn on_vim_visual_line(&mut self, _: &k::VimVisualLine, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.guard(window, cx) { return; }
+        if self.vim_mode == VimMode::VisualLine {
+            self.vim_to_normal();
+        } else {
+            // Normal or charwise Visual → line-wise: drop any char selection,
+            // then select the caret's whole block.
+            self.core.sel = Selection::caret(self.core.sel.head);
+            self.core.select_block(self.core.sel.head.block);
+            self.vim_mode = VimMode::VisualLine;
         }
         self.changed(window, cx);
     }
 
     fn on_vim_visual_delete(&mut self, _: &k::VimVisualDelete, window: &mut Window, cx: &mut Context<Self>) {
         if !self.guard(window, cx) { return; }
+        // `on_delete` deletes the block selection in Visual Line, else the
+        // charwise selection; both leave a valid caret.
         self.vim_mode = VimMode::Normal;
-        self.on_delete(&k::Delete, window, cx); // deletes the (non-collapsed) selection
+        self.on_delete(&k::Delete, window, cx);
     }
 
     fn on_vim_visual_yank(&mut self, _: &k::VimVisualYank, window: &mut Window, cx: &mut Context<Self>) {
         if !self.guard(window, cx) { return; }
-        self.copy_selection(cx);
-        self.vim_mode = VimMode::Normal;
-        self.core.sel = Selection::caret(self.core.sel.head);
+        self.copy_selection(cx); // handles both block and charwise selections
+        self.vim_to_normal();
         self.changed(window, cx);
     }
 
@@ -2375,11 +2401,7 @@ impl Editor {
             // Leave Insert/Visual for Normal, as Esc does in nvim (the tail
             // `changed` repaints the block caret). Leaving Visual clears the
             // selection.
-            let visual = self.vim_mode == VimMode::Visual;
-            self.vim_mode = VimMode::Normal;
-            if visual {
-                self.core.sel = Selection::caret(self.core.sel.head);
-            }
+            self.vim_to_normal();
         } else if self.read_only {
             // Nothing to select blocks for.
             self.core.sel = Selection::caret(self.core.sel.head);
@@ -2904,6 +2926,7 @@ impl Editor {
             .on_action(guard(cx, Self::on_vim_delete_line))
             .on_action(guard(cx, Self::on_vim_yank_line))
             .on_action(guard(cx, Self::on_vim_visual))
+            .on_action(guard(cx, Self::on_vim_visual_line))
             .on_action(guard(cx, Self::on_vim_visual_delete))
             .on_action(guard(cx, Self::on_vim_visual_yank))
             .on_action(guard(cx, Self::on_select_all))

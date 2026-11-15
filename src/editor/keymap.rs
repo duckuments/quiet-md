@@ -86,7 +86,8 @@ actions!(
         VimDeleteChar,   // x
         VimDeleteLine,   // dd
         VimYankLine,     // yy
-        VimVisual,       // v (toggle Visual)
+        VimVisual,       // v (toggle charwise Visual)
+        VimVisualLine,   // V (toggle line-wise Visual)
         VimVisualDelete, // d / x in Visual
         VimVisualYank,   // y in Visual
     ]
@@ -192,7 +193,11 @@ pub fn bind_keys(cx: &mut App) {
     ]);
     // PC clipboard keys (Ctrl+Insert after `shortcuts::pc_binding`).
     #[cfg(not(target_os = "macos"))]
-    cx.bind_keys([KeyBinding::new("shift-delete", Cut, c), KeyBinding::new("cmd-insert", Copy, c), KeyBinding::new("shift-insert", Paste, c)]);
+    cx.bind_keys([
+        KeyBinding::new("shift-delete", Cut, c),
+        KeyBinding::new("cmd-insert", Copy, c),
+        KeyBinding::new("shift-insert", Paste, c),
+    ]);
 
     // Vim Normal mode: letters are commands. These bindings only match when the
     // editor's key context carries `vim = normal` (set in render.rs when the
@@ -225,6 +230,7 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("p", Paste, vn),
         KeyBinding::new("u", Undo, vn),
         KeyBinding::new("v", VimVisual, vn),
+        KeyBinding::new("shift-v", VimVisualLine, vn),
     ]);
 
     // Vim Visual mode: motions extend the selection; d/y act on it then exit.
@@ -245,5 +251,6 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("x", VimVisualDelete, vv),
         KeyBinding::new("y", VimVisualYank, vv),
         KeyBinding::new("v", VimVisual, vv),
+        KeyBinding::new("shift-v", VimVisualLine, vv),
     ]);
 }
