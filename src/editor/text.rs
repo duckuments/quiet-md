@@ -270,6 +270,8 @@ pub struct RichTextElement {
     pub marked: Option<Range<usize>>,
     pub cache: LayoutCache,
     pub show_caret: bool,
+    /// Vim Normal/Visual: draw the caret as a block over the glyph, not a bar.
+    pub block_caret: bool,
     pub highlight: Option<Box<dyn Fn(&str) -> Vec<crate::highlight::Span>>>,
     /// 查找和替换 hits as (range, is_current), tinted over the glyphs.
     pub found: Vec<(Range<usize>, bool)>,
@@ -1180,9 +1182,20 @@ impl Element for RichTextElement {
                 layout.position_for(c)
             };
             // The caret: the accent, 2pt wide, the font's ascent + descent tall.
+            // Vim Normal/Visual: a block the width of the glyph under it, drawn
+            // translucent so the character stays legible.
             let font_h = px(self.spec.size * 1.18);
             let top = p.y + (lh - font_h) / 2.;
-            window.paint_quad(fill(Bounds::new(point(p.x, top), size(px(2.), font_h)), Theme::caret()).corner_radii(px(1.)));
+            let (w, color) = if self.block_caret && !self.caret_row_end {
+                let adv = self.text.text[c..].chars().next()
+                    .map(|ch| layout.position_for(c + ch.len_utf8()).x - p.x)
+                    .filter(|d| *d > px(0.) && *d < px(self.spec.size * 2.))
+                    .unwrap_or(px(self.spec.size * 0.55));
+                (adv.max(px(3.)), Theme::caret().opacity(0.4))
+            } else {
+                (px(2.), Theme::caret())
+            };
+            window.paint_quad(fill(Bounds::new(point(p.x, top), size(w, font_h)), color).corner_radii(px(1.)));
         }
     }
 }

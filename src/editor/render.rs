@@ -255,6 +255,7 @@ impl R<'_> {
             marked: self.ed.marked.as_ref().filter(|(b, _)| *b == id && !self.ghost).map(|(_, r)| r.clone()),
             cache: self.cache.clone(),
             show_caret: caret_here && self.focused && self.ed.caret_visible && !self.ed.read_only,
+            block_caret: crate::settings::vim() && self.ed.vim_mode != super::view::VimMode::Insert,
             highlight: None,
             found: if self.ghost { vec![] } else { self.ed.find_hits(id) },
             eq_counter: self.eqnos.get(&id).copied().unwrap_or(0),

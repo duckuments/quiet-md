@@ -17,6 +17,7 @@ use std::sync::{Arc, LazyLock, Mutex, RwLock};
 static FEISHU: AtomicBool = AtomicBool::new(false);
 static LANG: AtomicU8 = AtomicU8::new(Lang::En as u8);
 static MOTION_HIGH: AtomicBool = AtomicBool::new(false);
+static VIM: AtomicBool = AtomicBool::new(false);
 static PREFS: RwLock<Option<Preferences>> = RwLock::new(None);
 
 /// The active document theme draws blocks the 飞书 way (else Craft's).
@@ -40,6 +41,8 @@ pub fn lang() -> Lang { Lang::ALL.get(LANG.load(Ordering::Relaxed) as usize).cop
 pub fn english() -> bool { lang() != Lang::Zh }
 /// 外观 › 动画 is 丰富: folding, the selection and hover animate too (else they answer at once).
 pub fn motion_high() -> bool { MOTION_HIGH.load(Ordering::Relaxed) }
+/// Vim : modal editing (Normal/Insert/Visual) and a block caret in Normal.
+pub fn vim() -> bool { VIM.load(Ordering::Relaxed) }
 pub fn tr(zh: &'static str, en: &'static str) -> &'static str { match lang() { Lang::Zh => zh, Lang::En => en, l => crate::l10n::get(l, zh).unwrap_or(en) } }
 /// `localized_format!` for a given language: `zh` / `en` build the two
 /// originals; other languages refill their translation of `template`.
@@ -121,6 +124,8 @@ pub struct Preferences {
     pub ui_font: String,
     /// When 稍后 put off moving the library to real folders (Unix seconds; 0 never).
     pub migrate_later: u64,
+    /// Vim : modal editing is on.
+    pub vim: bool,
 }
 
 /// A week between asks to move the library to real folders.
@@ -148,7 +153,7 @@ fn system_lang() -> Lang {
 impl Default for Preferences {
     fn default() -> Self {
         let lang = system_lang();
-        Preferences { theme: String::new(), feishu: true, english: lang != Lang::Zh, language: lang.code().into(), remote_images: true, quick_hotkey: true, auto_update: true, appearance: String::new(), seen_version: String::new(), motion: String::new(), new_default: String::new(), last_new: String::new(), search_engine: String::new(), browser: String::new(), opaque_window: false, ui_font: String::new(), migrate_later: 0 }
+        Preferences { theme: String::new(), feishu: true, english: lang != Lang::Zh, language: lang.code().into(), remote_images: true, quick_hotkey: true, auto_update: true, appearance: String::new(), seen_version: String::new(), motion: String::new(), new_default: String::new(), last_new: String::new(), search_engine: String::new(), browser: String::new(), opaque_window: false, ui_font: String::new(), migrate_later: 0, vim: false }
     }
 }
 
@@ -183,6 +188,7 @@ fn apply(p: Preferences) {
     FEISHU.store(p.feishu, Ordering::Relaxed);
     LANG.store(p.lang() as u8, Ordering::Relaxed);
     MOTION_HIGH.store(p.motion == "high", Ordering::Relaxed);
+    VIM.store(p.vim, Ordering::Relaxed);
     // Before the themes are read (startup) the base comes from `feishu`.
     themes::select(&p.theme_id());
     *PREFS.write().unwrap() = Some(p);
@@ -928,6 +934,12 @@ impl Workspace {
                     row(tr("窗口背景", "Window background"), Some(tr("默认让侧栏透出桌面的毛玻璃。开启后整个窗口不透明，背景里动的东西不会透进来。", "By default the sidebar shows the desktop through a frosted surface. Turn this on for an opaque window.").into()),
                         switch("pref-opaque", prefs().opaque_window).on_click(cx.listener(|w, _, window, cx| {
                             w.set_pref(|p| p.opaque_window = !p.opaque_window, cx);
+                            window.refresh();
+                        }))).into_any_element(),
+                    // Vim : modal editing with a block caret in Normal mode.
+                    row(tr("Vim 模式", "Vim mode"), Some(tr("开启后按 nvim 的方式编辑：Normal / Insert / Visual 模式，Esc 回到 Normal，Normal 下光标是方块。", "Edit the nvim way: Normal / Insert / Visual modes, Esc returns to Normal, and a block caret in Normal.").into()),
+                        switch("pref-vim", prefs().vim).on_click(cx.listener(|w, _, window, cx| {
+                            w.set_pref(|p| p.vim = !p.vim, cx);
                             window.refresh();
                         }))).into_any_element(),
                     // 界面字号: the sidebar and this page together, so the pairs
