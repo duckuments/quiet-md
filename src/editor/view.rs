@@ -2392,6 +2392,25 @@ impl Editor {
         self.changed(window, cx);
     }
 
+    /// Visual Block j/k: move the head one line at the same column, keeping the
+    /// anchor — `move_v`'s collapsing path preserves the column (and `goal_x`),
+    /// so we reuse it and restore the anchor to extend the rectangle.
+    fn vblock_extend_v(&mut self, down: bool, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.guard(window, cx) { return; }
+        let anchor = self.core.sel.anchor;
+        self.move_v(down, false);
+        self.core.sel.anchor = anchor;
+        self.changed(window, cx);
+    }
+
+    fn on_vim_block_down(&mut self, _: &k::VimBlockDown, window: &mut Window, cx: &mut Context<Self>) {
+        self.vblock_extend_v(true, window, cx);
+    }
+
+    fn on_vim_block_up(&mut self, _: &k::VimBlockUp, window: &mut Window, cx: &mut Context<Self>) {
+        self.vblock_extend_v(false, window, cx);
+    }
+
     fn on_vim_visual_block_delete(&mut self, _: &k::VimVisualBlockDelete, window: &mut Window, cx: &mut Context<Self>) {
         if !self.guard(window, cx) { return; }
         self.core.delete_columns();
@@ -3025,6 +3044,8 @@ impl Editor {
             .on_action(guard(cx, Self::on_vim_visual_yank))
             .on_action(guard(cx, Self::on_vim_visual_block_delete))
             .on_action(guard(cx, Self::on_vim_visual_block_yank))
+            .on_action(guard(cx, Self::on_vim_block_down))
+            .on_action(guard(cx, Self::on_vim_block_up))
             .on_action(guard(cx, Self::on_vim_command))
             .on_action(guard(cx, Self::on_select_all))
             .on_action(guard(cx, Self::on_copy))

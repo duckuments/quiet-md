@@ -93,6 +93,8 @@ actions!(
         VimVisualYank,   // y in Visual
         VimVisualBlockDelete, // d / x in Visual Block
         VimVisualBlockYank,   // y in Visual Block
+        VimBlockDown,         // j in Visual Block (column-preserving)
+        VimBlockUp,           // k in Visual Block (column-preserving)
         VimCommand,           // : (ex command line)
     ]
 );
@@ -269,8 +271,10 @@ pub fn bind_keys(cx: &mut App) {
     cx.bind_keys([
         KeyBinding::new("h", SelectLeft, vb),
         KeyBinding::new("l", SelectRight, vb),
-        KeyBinding::new("j", SelectDown, vb),
-        KeyBinding::new("k", SelectUp, vb),
+        // Column-preserving vertical motion (not SelectDown/Up, which jump to
+        // the line edge and then into whole-block selection).
+        KeyBinding::new("j", VimBlockDown, vb),
+        KeyBinding::new("k", VimBlockUp, vb),
         KeyBinding::new("w", SelectWordRight, vb),
         KeyBinding::new("b", SelectWordLeft, vb),
         KeyBinding::new("0", SelectLineStart, vb),
