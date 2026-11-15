@@ -75,6 +75,13 @@ actions!(
         AlignRight,
         MoveBlockUp,
         MoveBlockDown,
+        // Vim: enter Insert mode from Normal (behave like nvim's i/a/I/A/o/O).
+        InsertHere,
+        InsertAfter,
+        InsertLineStart,
+        InsertLineEnd,
+        OpenBelow,
+        OpenAbove,
     ]
 );
 
@@ -179,4 +186,17 @@ pub fn bind_keys(cx: &mut App) {
     // PC clipboard keys (Ctrl+Insert after `shortcuts::pc_binding`).
     #[cfg(not(target_os = "macos"))]
     cx.bind_keys([KeyBinding::new("shift-delete", Cut, c), KeyBinding::new("cmd-insert", Copy, c), KeyBinding::new("shift-insert", Paste, c)]);
+
+    // Vim Normal mode: letters are commands. These bindings only match when the
+    // editor's key context carries `vim = normal` (set in render.rs when the
+    // Vim-mode setting is on), so default editing is untouched when it is off.
+    let vn = Some("Editor && vim == normal");
+    cx.bind_keys([
+        KeyBinding::new("i", InsertHere, vn),
+        KeyBinding::new("a", InsertAfter, vn),
+        KeyBinding::new("shift-i", InsertLineStart, vn),
+        KeyBinding::new("shift-a", InsertLineEnd, vn),
+        KeyBinding::new("o", OpenBelow, vn),
+        KeyBinding::new("shift-o", OpenAbove, vn),
+    ]);
 }

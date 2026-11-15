@@ -200,7 +200,7 @@ pub struct Editor {
     /// Painted bounds of the callout bar and its colour panel (last frame).
     pub callout_zone: Rc<RefCell<Vec<Bounds<Pixels>>>>,
     pub caret_visible: bool,
-    /// Vim `settings::vim()`）。
+    /// Current Vim mode (ignored while `settings::vim()` is off).
     pub vim_mode: VimMode,
     blink: Option<Task<()>>,
     pub goal_x: Option<Pixels>,
@@ -306,7 +306,8 @@ pub struct Editor {
     _subs: Vec<Subscription>,
 }
 
-/// Vim Normal/Visual,；Insert 。
+/// Vim mode. In Normal/Visual the caret is a block and letters are commands;
+/// in Insert text is typed as usual.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum VimMode {
     Normal,
@@ -2235,6 +2236,63 @@ impl Editor {
         self.changed(window, cx);
     }
 
+    /// Vim mode is on and the current mode swallows typed text (Normal/Visual).
+    pub(super) fn vim_blocks_input(&self) -> bool {
+        crate::settings::vim() && self.vim_mode != VimMode::Insert
+    }
+
+    /// Switch to Insert mode and show the bar caret (`changed` restarts the blink).
+    fn enter_insert(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.vim_mode = VimMode::Insert;
+        self.changed(window, cx);
+    }
+
+    fn on_insert_here(&mut self, _: &k::InsertHere, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.guard(window, cx) { return; }
+        self.enter_insert(window, cx);
+    }
+
+    fn on_insert_after(&mut self, _: &k::InsertAfter, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.guard(window, cx) || self.core.in_block_mode() { return; }
+        self.goal_x = None;
+        self.move_h(true, false, false);
+        self.enter_insert(window, cx);
+    }
+
+    fn on_insert_line_start(&mut self, _: &k::InsertLineStart, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.guard(window, cx) || self.core.in_block_mode() { return; }
+        self.goal_x = None;
+        self.line_edge(false, false);
+        self.enter_insert(window, cx);
+    }
+
+    fn on_insert_line_end(&mut self, _: &k::InsertLineEnd, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.guard(window, cx) || self.core.in_block_mode() { return; }
+        self.goal_x = None;
+        self.line_edge(true, false);
+        self.enter_insert(window, cx);
+    }
+
+    fn on_open_below(&mut self, _: &k::OpenBelow, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.guard(window, cx) || self.core.in_block_mode() { return; }
+        // Open a line below: go to the line end, then split (new paragraph).
+        self.goal_x = None;
+        self.line_edge(true, false);
+        self.on_enter(&k::Enter, window, cx);
+        self.enter_insert(window, cx);
+    }
+
+    fn on_open_above(&mut self, _: &k::OpenAbove, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.guard(window, cx) || self.core.in_block_mode() { return; }
+        // Open a line above: split at the line start, then step up into the
+        // new empty block left above the original content.
+        self.goal_x = None;
+        self.line_edge(false, false);
+        self.on_enter(&k::Enter, window, cx);
+        self.move_v(false, false);
+        self.enter_insert(window, cx);
+    }
+
     fn on_escape(&mut self, _: &k::Escape, window: &mut Window, cx: &mut Context<Self>) {
         if !self.guard(window, cx) {
             return;
@@ -2255,6 +2313,10 @@ impl Editor {
             self.menu = None;
         } else if self.find.is_some() {
             return self.close_find(window, cx);
+        } else if crate::settings::vim() && self.vim_mode != VimMode::Normal {
+            // Leave Insert/Visual for Normal, as Esc does in nvim (the tail
+            // `changed` repaints the block caret).
+            self.vim_mode = VimMode::Normal;
         } else if self.read_only {
             // Nothing to select blocks for.
             self.core.sel = Selection::caret(self.core.sel.head);
@@ -2769,6 +2831,12 @@ impl Editor {
             .on_action(guard(cx, Self::on_tab))
             .on_action(guard(cx, Self::on_shift_tab))
             .on_action(guard(cx, Self::on_escape))
+            .on_action(guard(cx, Self::on_insert_here))
+            .on_action(guard(cx, Self::on_insert_after))
+            .on_action(guard(cx, Self::on_insert_line_start))
+            .on_action(guard(cx, Self::on_insert_line_end))
+            .on_action(guard(cx, Self::on_open_below))
+            .on_action(guard(cx, Self::on_open_above))
             .on_action(guard(cx, Self::on_select_all))
             .on_action(guard(cx, Self::on_copy))
             .on_action(guard(cx, Self::on_copy_markdown))
@@ -3388,7 +3456,8 @@ impl EntityInputHandler for Editor {
         cx: &mut Context<Self>,
     ) {
         self.pointer_hidden = true;
-        if self.core.in_block_mode() {
+        // Vim Normal/Visual: keystrokes are commands, not text.
+        if self.core.in_block_mode() || self.vim_blocks_input() {
             return;
         }
         let head = self.core.sel.head.block;
@@ -3421,7 +3490,7 @@ impl EntityInputHandler for Editor {
         cx: &mut Context<Self>,
     ) {
         self.pointer_hidden = true;
-        if self.core.in_block_mode() {
+        if self.core.in_block_mode() || self.vim_blocks_input() {
             return;
         }
         if self.core.text_of(self.core.sel.head.block).is_none()

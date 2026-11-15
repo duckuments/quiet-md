@@ -41,7 +41,7 @@ pub fn lang() -> Lang { Lang::ALL.get(LANG.load(Ordering::Relaxed) as usize).cop
 pub fn english() -> bool { lang() != Lang::Zh }
 /// 外观 › 动画 is 丰富: folding, the selection and hover animate too (else they answer at once).
 pub fn motion_high() -> bool { MOTION_HIGH.load(Ordering::Relaxed) }
-/// Vim : modal editing (Normal/Insert/Visual) and a block caret in Normal.
+/// Vim mode: modal editing (Normal/Insert/Visual) and a block caret in Normal.
 pub fn vim() -> bool { VIM.load(Ordering::Relaxed) }
 pub fn tr(zh: &'static str, en: &'static str) -> &'static str { match lang() { Lang::Zh => zh, Lang::En => en, l => crate::l10n::get(l, zh).unwrap_or(en) } }
 /// `localized_format!` for a given language: `zh` / `en` build the two
@@ -124,7 +124,7 @@ pub struct Preferences {
     pub ui_font: String,
     /// When 稍后 put off moving the library to real folders (Unix seconds; 0 never).
     pub migrate_later: u64,
-    /// Vim : modal editing is on.
+    /// Vim mode: modal editing is on.
     pub vim: bool,
 }
 
@@ -936,8 +936,8 @@ impl Workspace {
                             w.set_pref(|p| p.opaque_window = !p.opaque_window, cx);
                             window.refresh();
                         }))).into_any_element(),
-                    // Vim : modal editing with a block caret in Normal mode.
-                    row(tr("Vim 模式", "Vim mode"), Some(tr("开启后按 nvim 的方式编辑：Normal / Insert / Visual 模式，Esc 回到 Normal，Normal 下光标是方块。", "Edit the nvim way: Normal / Insert / Visual modes, Esc returns to Normal, and a block caret in Normal.").into()),
+                    // Vim mode: modal editing with a block caret in Normal mode.
+                    row(tr("Vim mode", "Vim mode"), Some(tr("Edit the nvim way: Normal / Insert / Visual modes, Esc returns to Normal, and a block caret in Normal.", "Edit the nvim way: Normal / Insert / Visual modes, Esc returns to Normal, and a block caret in Normal.").into()),
                         switch("pref-vim", prefs().vim).on_click(cx.listener(|w, _, window, cx| {
                             w.set_pref(|p| p.vim = !p.vim, cx);
                             window.refresh();

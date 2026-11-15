@@ -1596,8 +1596,14 @@ impl Editor {
         .left_0()
         .size_full();
 
+        // Vim mode layers a `vim = normal|insert|visual` attribute onto the
+        // Editor context so Normal-mode letter bindings (keymap.rs) can match.
+        let ctx = if read_only { "EditorRO".to_string() } else if crate::settings::vim() {
+            let m = match self.vim_mode { super::view::VimMode::Normal => "normal", super::view::VimMode::Insert => "insert", super::view::VimMode::Visual => "visual" };
+            format!("Editor vim = {m}")
+        } else { "Editor".to_string() };
         let root = div()
-            .key_context(if read_only { "EditorRO" } else { "Editor" })
+            .key_context(ctx.as_str())
             .when(read_only, |d| {
                 d.on_key_down(cx.listener(|ed, ev: &KeyDownEvent, window, cx| {
                     if ed.focus.is_focused(window) {
