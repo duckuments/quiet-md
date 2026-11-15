@@ -2275,11 +2275,12 @@ impl Editor {
 
     fn on_open_below(&mut self, _: &k::OpenBelow, window: &mut Window, cx: &mut Context<Self>) {
         if !self.guard(window, cx) || self.core.in_block_mode() { return; }
-        // Open a line below: go to the line end, then split (new paragraph).
+        // Open a line below: go to the line end, switch to Insert, then split
+        // the paragraph (the direct `on_enter` call does its own `changed`).
         self.goal_x = None;
         self.line_edge(true, false);
+        self.vim_mode = VimMode::Insert;
         self.on_enter(&k::Enter, window, cx);
-        self.enter_insert(window, cx);
     }
 
     fn on_open_above(&mut self, _: &k::OpenAbove, window: &mut Window, cx: &mut Context<Self>) {
@@ -2288,9 +2289,10 @@ impl Editor {
         // new empty block left above the original content.
         self.goal_x = None;
         self.line_edge(false, false);
+        self.vim_mode = VimMode::Insert;
         self.on_enter(&k::Enter, window, cx);
         self.move_v(false, false);
-        self.enter_insert(window, cx);
+        self.changed(window, cx);
     }
 
     fn on_escape(&mut self, _: &k::Escape, window: &mut Window, cx: &mut Context<Self>) {
@@ -2820,16 +2822,16 @@ impl Editor {
             .on_action(guard(cx, Self::on_doc_end))
             .on_action(guard(cx, Self::on_select_to_doc_start))
             .on_action(guard(cx, Self::on_select_to_doc_end))
-            .on_action(guard(cx, Self::on_backspace))
-            .on_action(guard(cx, Self::on_delete))
-            .on_action(guard(cx, Self::on_delete_word_back))
-            .on_action(guard(cx, Self::on_delete_word_forward))
-            .on_action(guard(cx, Self::on_delete_to_line_start))
-            .on_action(guard(cx, Self::on_enter))
-            .on_action(guard(cx, Self::on_soft_break))
-            .on_action(guard(cx, Self::on_toggle_todo))
-            .on_action(guard(cx, Self::on_tab))
-            .on_action(guard(cx, Self::on_shift_tab))
+            .on_action(edit_guard(cx, Self::on_backspace))
+            .on_action(edit_guard(cx, Self::on_delete))
+            .on_action(edit_guard(cx, Self::on_delete_word_back))
+            .on_action(edit_guard(cx, Self::on_delete_word_forward))
+            .on_action(edit_guard(cx, Self::on_delete_to_line_start))
+            .on_action(edit_guard(cx, Self::on_enter))
+            .on_action(edit_guard(cx, Self::on_soft_break))
+            .on_action(edit_guard(cx, Self::on_toggle_todo))
+            .on_action(edit_guard(cx, Self::on_tab))
+            .on_action(edit_guard(cx, Self::on_shift_tab))
             .on_action(guard(cx, Self::on_escape))
             .on_action(guard(cx, Self::on_insert_here))
             .on_action(guard(cx, Self::on_insert_after))
@@ -3586,6 +3588,23 @@ fn guard<A: Action, F: Fn(&mut Editor, &A, &mut Window, &mut Context<Editor>) + 
         } else {
             cx.propagate()
         }
+    })
+}
+
+/// Like `guard`, but swallows the action in Vim Normal/Visual mode — editing
+/// keys (Backspace, Enter, Tab…) must not mutate the document there. Wrapping
+/// at the action boundary catches every keystroke that routes to the handler.
+fn edit_guard<A: Action, F: Fn(&mut Editor, &A, &mut Window, &mut Context<Editor>) + 'static>(
+    cx: &mut Context<Editor>,
+    f: F,
+) -> impl Fn(&A, &mut Window, &mut App) + 'static {
+    cx.listener(move |e, a: &A, w, cx| {
+        if e.cd.dialog.is_some() {
+            cx.propagate()
+        } else if !e.vim_blocks_input() {
+            f(e, a, w, cx)
+        }
+        // else: Vim Normal/Visual swallows editing keys (motions stay bound).
     })
 }
 
