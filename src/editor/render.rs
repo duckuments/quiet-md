@@ -1373,6 +1373,16 @@ impl Editor {
         let origin0 = self.content_origin.get();
         let counter = self.word_counter();
         let find_box = self.find_box(window, cx);
+        // Vim `:` ex command line, docked at the bottom like a terminal's.
+        let vim_cmd_bar = self.vim_cmd_open.then(|| {
+            div().absolute().bottom_0().left_0().right_0()
+                .flex().items_center().gap(px(6.))
+                .px(px(12.)).py(px(6.))
+                .bg(crate::theme::raised(Theme::bg_body())).border_t_1().border_color(Theme::line_border())
+                .text_color(Theme::text())
+                .child(":")
+                .child(div().flex_1().child(self.vim_cmd.clone()))
+        });
         if std::mem::take(&mut self.autoscroll) && self.reveal.is_none() {
             self.reveal = Some((Reveal::Caret, 0));
         }
@@ -1668,6 +1678,7 @@ impl Editor {
             .children(image_layer)
             .children(counter)
             .children(find_box)
+            .children(vim_cmd_bar)
             .children(lightbox)
             .children(toast)
             .child(root_canvas)

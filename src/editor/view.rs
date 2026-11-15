@@ -202,6 +202,9 @@ pub struct Editor {
     pub caret_visible: bool,
     /// Current Vim mode (ignored while `settings::vim()` is off).
     pub vim_mode: VimMode,
+    /// The `:` ex command line input; shown only while `vim_cmd_open`.
+    pub(super) vim_cmd: Entity<TextField>,
+    pub(super) vim_cmd_open: bool,
     blink: Option<Task<()>>,
     pub goal_x: Option<Pixels>,
     /// The caret was placed on a wrap boundary from the row above: draw it at
@@ -371,6 +374,7 @@ impl Editor {
             f.line_height = 24.;
             f
         });
+        let vim_cmd = cx.new(|cx| TextField::new("", cx));
         let find_field = cx.new(|cx| TextField::new("在文档内查找", cx));
         let replace_field = cx.new(|cx| TextField::new("请输入文字", cx));
         let number_field = cx.new(|cx| TextField::new("编号", cx));
@@ -396,6 +400,15 @@ impl Editor {
                         TextFieldEvent::Cancel => this.close_menu_focus(window, cx),
                         _ => cx.notify(),
                     }
+                },
+            ),
+            cx.subscribe_in(
+                &vim_cmd,
+                window,
+                |this, _, ev: &TextFieldEvent, window, cx| match ev {
+                    TextFieldEvent::Submit => this.run_vim_command(window, cx),
+                    TextFieldEvent::Cancel => this.close_vim_command(window, cx),
+                    _ => {}
                 },
             ),
             cx.subscribe_in(
@@ -526,6 +539,8 @@ impl Editor {
             callout_zone: Rc::default(),
             caret_visible: true,
             vim_mode: VimMode::Normal,
+            vim_cmd,
+            vim_cmd_open: false,
             blink: None,
             goal_x: None,
             caret_row_end: None,
@@ -2391,6 +2406,55 @@ impl Editor {
         self.changed(window, cx);
     }
 
+    fn on_vim_command(&mut self, _: &k::VimCommand, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.guard(window, cx) { return; }
+        self.vim_cmd_open = true;
+        self.vim_cmd.update(cx, |f, cx| f.set_text("", cx));
+        window.focus(&self.vim_cmd.focus_handle(cx));
+        cx.notify();
+    }
+
+    fn close_vim_command(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.vim_cmd_open = false;
+        window.focus(&self.focus);
+        cx.notify();
+    }
+
+    /// Run an ex command: `:w` save, `:q`/`:q!` leave, `:wq`/`:x` both, `:<n>`
+    /// jump to the nth line. Unknown commands are ignored.
+    fn run_vim_command(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let cmd = self.vim_cmd.read(cx).text.trim().trim_start_matches(':').to_string();
+        self.close_vim_command(window, cx);
+        let (save, quit) = match cmd.as_str() {
+            "w" | "write" => (true, false),
+            "q" | "q!" | "quit" => (false, true),
+            "wq" | "x" => (true, true),
+            n => {
+                if let Ok(line) = n.parse::<usize>() {
+                    self.vim_goto_line(line, window, cx);
+                }
+                (false, false)
+            }
+        };
+        if save {
+            self.core.break_coalescing();
+            cx.emit(EditorEvent::Save);
+        }
+        if quit {
+            window.dispatch_action(Box::new(crate::app::GoHome), cx);
+        }
+    }
+
+    /// Put the caret at the start of the nth text line (1-based, clamped).
+    fn vim_goto_line(&mut self, line: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let units = self.core.units();
+        let texts: Vec<_> = units.iter().filter(|u| u.text).collect();
+        if texts.is_empty() { return; }
+        let i = line.saturating_sub(1).min(texts.len() - 1);
+        self.core.sel = Selection::caret(Pos::new(texts[i].id, 0));
+        self.changed(window, cx);
+    }
+
     fn on_vim_visual_delete(&mut self, _: &k::VimVisualDelete, window: &mut Window, cx: &mut Context<Self>) {
         if !self.guard(window, cx) { return; }
         // `on_delete` deletes the block selection in Visual Line, else the
@@ -2961,6 +3025,7 @@ impl Editor {
             .on_action(guard(cx, Self::on_vim_visual_yank))
             .on_action(guard(cx, Self::on_vim_visual_block_delete))
             .on_action(guard(cx, Self::on_vim_visual_block_yank))
+            .on_action(guard(cx, Self::on_vim_command))
             .on_action(guard(cx, Self::on_select_all))
             .on_action(guard(cx, Self::on_copy))
             .on_action(guard(cx, Self::on_copy_markdown))
