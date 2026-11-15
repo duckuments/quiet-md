@@ -1615,7 +1615,7 @@ impl Editor {
 
         // Vim mode layers a `vim = normal|insert|visual` attribute onto the
         // Editor context so Normal-mode letter bindings (keymap.rs) can match.
-        let ctx = if read_only { "EditorRO".to_string() } else if crate::settings::vim() {
+        let ctx = if read_only { "EditorRO".to_string() } else if crate::settings::vim() && !self.vim_replace_pending {
             use super::view::VimMode;
             // Visual Line shares the charwise Visual key bindings (the motion
             // and operator handlers branch on the block selection themselves);

@@ -95,6 +95,7 @@ actions!(
         VimVisualBlockYank,   // y in Visual Block
         VimBlockDown,         // j in Visual Block (column-preserving)
         VimBlockUp,           // k in Visual Block (column-preserving)
+        VimReplace,           // r (replace the char under the caret)
         VimCommand,           // : (ex command line)
     ]
 );
@@ -237,6 +238,7 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("u", Undo, vn),
         KeyBinding::new("v", VimVisual, vn),
         KeyBinding::new("shift-v", VimVisualLine, vn),
+        KeyBinding::new("r", VimReplace, vn),
         KeyBinding::new(":", VimCommand, vn),
         // ctrl-v (cmd-v, PC-mapped to ctrl-v) enters Visual Block; in Insert or
         // with Vim off it falls through to the Editor binding and pastes.

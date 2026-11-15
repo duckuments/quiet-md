@@ -577,6 +577,21 @@ impl Core {
         Some(a..b)
     }
 
+    /// Vim `r`: replace the grapheme under the caret with `s`, leaving the
+    /// caret on it. No-op at end of line (nothing to replace).
+    pub fn replace_char(&mut self, s: &str) {
+        let p = self.sel.head;
+        let end = match self.text_of(p.block) {
+            Some(t) if p.offset < t.len() => next_grapheme(&t.text, p.offset),
+            _ => return,
+        };
+        self.checkpoint(EditKind::Other);
+        if let Some(t) = self.text_mut(p.block) {
+            t.replace(p.offset..end, &RichText::plain(s));
+        }
+        self.sel = Selection::caret(p);
+    }
+
     /// Visual Block column range within block `id`: the same byte-column span
     /// `[c0,c1)` on every covered line, clamped to the line and to char
     /// boundaries. `None` if `id` is outside the rectangle or not text.

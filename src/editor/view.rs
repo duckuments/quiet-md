@@ -205,6 +205,9 @@ pub struct Editor {
     /// The `:` ex command line input; shown only while `vim_cmd_open`.
     pub(super) vim_cmd: Entity<TextField>,
     pub(super) vim_cmd_open: bool,
+    /// Vim `r` was pressed: the next typed character replaces the one under the
+    /// caret (the key context drops `vim` for that keystroke so it reaches input).
+    pub(super) vim_replace_pending: bool,
     blink: Option<Task<()>>,
     pub goal_x: Option<Pixels>,
     /// The caret was placed on a wrap boundary from the row above: draw it at
@@ -541,6 +544,7 @@ impl Editor {
             vim_mode: VimMode::Normal,
             vim_cmd,
             vim_cmd_open: false,
+            vim_replace_pending: false,
             blink: None,
             goal_x: None,
             caret_row_end: None,
@@ -2425,6 +2429,14 @@ impl Editor {
         self.changed(window, cx);
     }
 
+    fn on_vim_replace(&mut self, _: &k::VimReplace, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.guard(window, cx) || self.core.in_block_mode() { return; }
+        // Arm replace; the re-render drops `vim` from the key context so the
+        // next character reaches `replace_text_in_range`.
+        self.vim_replace_pending = true;
+        cx.notify();
+    }
+
     fn on_vim_command(&mut self, _: &k::VimCommand, window: &mut Window, cx: &mut Context<Self>) {
         if !self.guard(window, cx) { return; }
         self.vim_cmd_open = true;
@@ -2501,6 +2513,12 @@ impl Editor {
         }
         if self.cropping() {
             return self.cancel_crop(cx);
+        }
+        if self.vim_replace_pending {
+            // `r` then Esc cancels the pending replacement.
+            self.vim_replace_pending = false;
+            cx.notify();
+            return;
         }
         if self.mention.is_some() {
             self.mention = None;
@@ -3046,6 +3064,7 @@ impl Editor {
             .on_action(guard(cx, Self::on_vim_visual_block_yank))
             .on_action(guard(cx, Self::on_vim_block_down))
             .on_action(guard(cx, Self::on_vim_block_up))
+            .on_action(guard(cx, Self::on_vim_replace))
             .on_action(guard(cx, Self::on_vim_command))
             .on_action(guard(cx, Self::on_select_all))
             .on_action(guard(cx, Self::on_copy))
@@ -3666,6 +3685,17 @@ impl EntityInputHandler for Editor {
         cx: &mut Context<Self>,
     ) {
         self.pointer_hidden = true;
+        // Vim `r`: the armed keystroke replaces the char under the caret.
+        if self.vim_replace_pending {
+            self.vim_replace_pending = false;
+            if !text.is_empty() && !self.core.in_block_mode() {
+                self.core.replace_char(text);
+                self.changed(window, cx);
+            } else {
+                cx.notify();
+            }
+            return;
+        }
         // Vim Normal/Visual: keystrokes are commands, not text.
         if self.core.in_block_mode() || self.vim_blocks_input() {
             return;
