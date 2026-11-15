@@ -82,6 +82,13 @@ actions!(
         InsertLineEnd,
         OpenBelow,
         OpenAbove,
+        // Vim Normal operators (motions reuse the Move*/Word*/Line*/Doc* actions).
+        VimDeleteChar,   // x
+        VimDeleteLine,   // dd
+        VimYankLine,     // yy
+        VimVisual,       // v (toggle Visual)
+        VimVisualDelete, // d / x in Visual
+        VimVisualYank,   // y in Visual
     ]
 );
 
@@ -192,11 +199,51 @@ pub fn bind_keys(cx: &mut App) {
     // Vim-mode setting is on), so default editing is untouched when it is off.
     let vn = Some("Editor && vim == normal");
     cx.bind_keys([
+        // Enter Insert.
         KeyBinding::new("i", InsertHere, vn),
         KeyBinding::new("a", InsertAfter, vn),
         KeyBinding::new("shift-i", InsertLineStart, vn),
         KeyBinding::new("shift-a", InsertLineEnd, vn),
         KeyBinding::new("o", OpenBelow, vn),
         KeyBinding::new("shift-o", OpenAbove, vn),
+        // Motions (reuse the existing caret actions).
+        KeyBinding::new("h", MoveLeft, vn),
+        KeyBinding::new("l", MoveRight, vn),
+        KeyBinding::new("j", MoveDown, vn),
+        KeyBinding::new("k", MoveUp, vn),
+        KeyBinding::new("w", WordRight, vn),
+        KeyBinding::new("b", WordLeft, vn),
+        KeyBinding::new("e", WordRight, vn),
+        KeyBinding::new("0", LineStart, vn),
+        KeyBinding::new("$", LineEnd, vn),
+        KeyBinding::new("g g", DocStart, vn),
+        KeyBinding::new("shift-g", DocEnd, vn),
+        // Operators and mode.
+        KeyBinding::new("x", VimDeleteChar, vn),
+        KeyBinding::new("d d", VimDeleteLine, vn),
+        KeyBinding::new("y y", VimYankLine, vn),
+        KeyBinding::new("p", Paste, vn),
+        KeyBinding::new("u", Undo, vn),
+        KeyBinding::new("v", VimVisual, vn),
+    ]);
+
+    // Vim Visual mode: motions extend the selection; d/y act on it then exit.
+    let vv = Some("Editor && vim == visual");
+    cx.bind_keys([
+        KeyBinding::new("h", SelectLeft, vv),
+        KeyBinding::new("l", SelectRight, vv),
+        KeyBinding::new("j", SelectDown, vv),
+        KeyBinding::new("k", SelectUp, vv),
+        KeyBinding::new("w", SelectWordRight, vv),
+        KeyBinding::new("b", SelectWordLeft, vv),
+        KeyBinding::new("e", SelectWordRight, vv),
+        KeyBinding::new("0", SelectLineStart, vv),
+        KeyBinding::new("$", SelectLineEnd, vv),
+        KeyBinding::new("g g", SelectToDocStart, vv),
+        KeyBinding::new("shift-g", SelectToDocEnd, vv),
+        KeyBinding::new("d", VimVisualDelete, vv),
+        KeyBinding::new("x", VimVisualDelete, vv),
+        KeyBinding::new("y", VimVisualYank, vv),
+        KeyBinding::new("v", VimVisual, vv),
     ]);
 }

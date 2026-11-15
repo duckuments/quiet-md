@@ -2295,6 +2295,62 @@ impl Editor {
         self.changed(window, cx);
     }
 
+    fn on_vim_delete_char(&mut self, _: &k::VimDeleteChar, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.guard(window, cx) || self.core.in_block_mode() { return; }
+        // nvim `x`: only remove a char sitting under the caret, never join lines.
+        if self.core.sel.is_collapsed() {
+            let h = self.core.sel.head;
+            let len = self.core.text_of(h.block).map(|t| t.len()).unwrap_or(0);
+            if h.offset >= len { return; }
+        }
+        self.on_delete(&k::Delete, window, cx);
+    }
+
+    fn on_vim_delete_line(&mut self, _: &k::VimDeleteLine, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.guard(window, cx) || self.core.in_block_mode() { return; }
+        let h = self.core.sel.head.block;
+        if h == TITLE { return; } // keep the document title
+        self.core.delete_block(h); // checkpoints and repositions the caret
+        self.changed(window, cx);
+    }
+
+    fn on_vim_yank_line(&mut self, _: &k::VimYankLine, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.guard(window, cx) || self.core.in_block_mode() { return; }
+        let h = self.core.sel.head.block;
+        let Some(len) = self.core.text_of(h).map(|t| t.len()) else { return; };
+        // Copy the whole line by selecting it, then restore the caret.
+        let saved = self.core.sel;
+        self.core.sel = Selection { anchor: Pos::new(h, 0), head: Pos::new(h, len) };
+        self.copy_selection(cx);
+        self.core.sel = saved;
+        self.changed(window, cx);
+    }
+
+    fn on_vim_visual(&mut self, _: &k::VimVisual, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.guard(window, cx) { return; }
+        if self.vim_mode == VimMode::Visual {
+            self.vim_mode = VimMode::Normal;
+            self.core.sel = Selection::caret(self.core.sel.head);
+        } else {
+            self.vim_mode = VimMode::Visual;
+        }
+        self.changed(window, cx);
+    }
+
+    fn on_vim_visual_delete(&mut self, _: &k::VimVisualDelete, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.guard(window, cx) { return; }
+        self.vim_mode = VimMode::Normal;
+        self.on_delete(&k::Delete, window, cx); // deletes the (non-collapsed) selection
+    }
+
+    fn on_vim_visual_yank(&mut self, _: &k::VimVisualYank, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.guard(window, cx) { return; }
+        self.copy_selection(cx);
+        self.vim_mode = VimMode::Normal;
+        self.core.sel = Selection::caret(self.core.sel.head);
+        self.changed(window, cx);
+    }
+
     fn on_escape(&mut self, _: &k::Escape, window: &mut Window, cx: &mut Context<Self>) {
         if !self.guard(window, cx) {
             return;
@@ -2317,8 +2373,13 @@ impl Editor {
             return self.close_find(window, cx);
         } else if crate::settings::vim() && self.vim_mode != VimMode::Normal {
             // Leave Insert/Visual for Normal, as Esc does in nvim (the tail
-            // `changed` repaints the block caret).
+            // `changed` repaints the block caret). Leaving Visual clears the
+            // selection.
+            let visual = self.vim_mode == VimMode::Visual;
             self.vim_mode = VimMode::Normal;
+            if visual {
+                self.core.sel = Selection::caret(self.core.sel.head);
+            }
         } else if self.read_only {
             // Nothing to select blocks for.
             self.core.sel = Selection::caret(self.core.sel.head);
@@ -2839,6 +2900,12 @@ impl Editor {
             .on_action(guard(cx, Self::on_insert_line_end))
             .on_action(guard(cx, Self::on_open_below))
             .on_action(guard(cx, Self::on_open_above))
+            .on_action(guard(cx, Self::on_vim_delete_char))
+            .on_action(guard(cx, Self::on_vim_delete_line))
+            .on_action(guard(cx, Self::on_vim_yank_line))
+            .on_action(guard(cx, Self::on_vim_visual))
+            .on_action(guard(cx, Self::on_vim_visual_delete))
+            .on_action(guard(cx, Self::on_vim_visual_yank))
             .on_action(guard(cx, Self::on_select_all))
             .on_action(guard(cx, Self::on_copy))
             .on_action(guard(cx, Self::on_copy_markdown))
