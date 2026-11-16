@@ -97,6 +97,9 @@ actions!(
         VimBlockDown,         // j in Visual Block (column-preserving)
         VimBlockUp,           // k in Visual Block (column-preserving)
         VimReplace,           // r (replace the char under the caret)
+        VimMarkSet,           // m{a-z} (record the caret under a name)
+        VimMarkJumpExact,     // `{a-z} (jump to the exact mark)
+        VimMarkJumpLine,      // '{a-z} (jump to the mark's line start)
         VimCommand,           // : (ex command line)
         // Vim text objects: `i`/`a` after an operator wait for the object key.
         VimTextObjInner,      // i (after d/c/y)
@@ -270,6 +273,9 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("v", VimVisual, vn),
         KeyBinding::new("shift-v", VimVisualLine, vn),
         KeyBinding::new("r", VimReplace, vn),
+        KeyBinding::new("m", VimMarkSet, vn),
+        KeyBinding::new("`", VimMarkJumpExact, vn),
+        KeyBinding::new("'", VimMarkJumpLine, vn),
         KeyBinding::new(":", VimCommand, vn),
         // ctrl-v (cmd-v, PC-mapped to ctrl-v) enters Visual Block; in Insert or
         // with Vim off it falls through to the Editor binding and pastes.

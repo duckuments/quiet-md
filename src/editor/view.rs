@@ -213,6 +213,12 @@ pub struct Editor {
     /// Vim `r` was pressed: the next typed character replaces the one under the
     /// caret (the key context drops `vim` for that keystroke so it reaches input).
     pub(super) vim_replace_pending: bool,
+    /// Vim `m`/`` ` ``/`'` was pressed: the next letter names the mark to set
+    /// or jump to (same context-drop trick as `vim_replace_pending`).
+    pub(super) vim_mark_pending: Option<VimMarkOp>,
+    /// Named caret positions (`m{a-z}`), local to this document like nvim's
+    /// lowercase marks — resets naturally since `Editor` is per-document.
+    pub(super) vim_marks: HashMap<char, Pos>,
     /// Pending operator (`d`/`c`/`y`) and the caret it was armed at; the next
     /// motion defines the range it applies to.
     pub(super) vim_pending_op: Option<(VimOp, Pos)>,
@@ -350,6 +356,17 @@ pub enum VimMode {
 /// A pending Vim operator (`d`/`c`/`y`) waiting for a motion to define its range.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum VimOp { Delete, Change, Yank }
+
+/// Which of `m`/`` ` ``/`'` armed `vim_mark_pending`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(super) enum VimMarkOp {
+    /// `m{a-z}`: record the caret under that name.
+    Set,
+    /// `` `{a-z} ``: jump to the exact recorded position.
+    JumpExact,
+    /// `'{a-z}`: jump to the start of the recorded position's line.
+    JumpLineStart,
+}
 
 /// How the most recent Vim yank should be pasted back. The system clipboard
 /// (used for the actual text, so yank/paste still cross documents) carries
@@ -633,6 +650,8 @@ impl Editor {
             vim_cmd_open: false,
             vim_sub_preview: None,
             vim_replace_pending: false,
+            vim_mark_pending: None,
+            vim_marks: HashMap::new(),
             vim_search_bar: false,
             vim_search_quiet: false,
             vim_search_prefix: '/',
@@ -2357,6 +2376,12 @@ impl Editor {
         crate::settings::vim() && self.vim_mode != VimMode::Insert
     }
 
+    /// `r`, `m`, `` ` ``, or `'` is waiting for its next character — the key
+    /// context drops `vim` for that one keystroke (see `on_vim_replace`).
+    pub(super) fn vim_awaiting_char(&self) -> bool {
+        self.vim_replace_pending || self.vim_mark_pending.is_some()
+    }
+
     /// Switch to Insert mode and show the bar caret (`changed` restarts the blink).
     fn enter_insert(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.vim_mode = VimMode::Insert;
@@ -2762,6 +2787,21 @@ impl Editor {
         cx.notify();
     }
 
+    fn vim_arm_mark(&mut self, op: VimMarkOp, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.guard(window, cx) { return; }
+        self.vim_mark_pending = Some(op);
+        cx.notify();
+    }
+    fn on_vim_mark_set(&mut self, _: &k::VimMarkSet, window: &mut Window, cx: &mut Context<Self>) {
+        self.vim_arm_mark(VimMarkOp::Set, window, cx);
+    }
+    fn on_vim_mark_jump_exact(&mut self, _: &k::VimMarkJumpExact, window: &mut Window, cx: &mut Context<Self>) {
+        self.vim_arm_mark(VimMarkOp::JumpExact, window, cx);
+    }
+    fn on_vim_mark_jump_line(&mut self, _: &k::VimMarkJumpLine, window: &mut Window, cx: &mut Context<Self>) {
+        self.vim_arm_mark(VimMarkOp::JumpLineStart, window, cx);
+    }
+
     fn on_vim_command(&mut self, _: &k::VimCommand, window: &mut Window, cx: &mut Context<Self>) {
         if !self.guard(window, cx) { return; }
         self.vim_cmd_open = true;
@@ -2886,9 +2926,11 @@ impl Editor {
         if self.cropping() {
             return self.cancel_crop(cx);
         }
-        if self.vim_replace_pending {
-            // `r` then Esc cancels the pending replacement.
+        if self.vim_awaiting_char() {
+            // `r`/`m`/`` ` ``/`'` then Esc cancels, instead of the next
+            // keystroke being consumed as a replacement/mark name.
             self.vim_replace_pending = false;
+            self.vim_mark_pending = None;
             cx.notify();
             return;
         }
@@ -3496,6 +3538,9 @@ impl Editor {
             .on_action(guard(cx, Self::on_vim_block_down))
             .on_action(guard(cx, Self::on_vim_block_up))
             .on_action(guard(cx, Self::on_vim_replace))
+            .on_action(guard(cx, Self::on_vim_mark_set))
+            .on_action(guard(cx, Self::on_vim_mark_jump_exact))
+            .on_action(guard(cx, Self::on_vim_mark_jump_line))
             .on_action(guard(cx, Self::on_vim_command))
             .on_action(guard(cx, Self::on_select_all))
             .on_action(guard(cx, Self::on_copy))
@@ -4125,6 +4170,30 @@ impl EntityInputHandler for Editor {
             } else {
                 cx.notify();
             }
+            return;
+        }
+        // Vim `m`/`` ` ``/`'`: the armed keystroke names the mark.
+        if let Some(op) = self.vim_mark_pending.take() {
+            if let Some(c) = text.chars().next().filter(|c| c.is_ascii_alphabetic()) {
+                match op {
+                    VimMarkOp::Set => {
+                        self.vim_marks.insert(c, self.core.sel.head);
+                    }
+                    VimMarkOp::JumpExact | VimMarkOp::JumpLineStart => match self.vim_marks.get(&c) {
+                        Some(&pos) if self.core.block(pos.block).is_some() => {
+                            let p = if op == VimMarkOp::JumpLineStart { Pos::new(pos.block, 0) } else { pos };
+                            self.core.sel = Selection::caret(p);
+                            // Text at the mark may have shrunk since it was set.
+                            self.core.fix_selection();
+                        }
+                        // The block was deleted since the mark was set — drop it.
+                        _ => {
+                            self.vim_marks.remove(&c);
+                        }
+                    },
+                }
+            }
+            self.changed(window, cx);
             return;
         }
         // Vim Normal/Visual: keystrokes are commands, not text.
