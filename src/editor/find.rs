@@ -171,6 +171,37 @@ impl Editor {
         cx.notify();
     }
 
+    /// `:s/old/new/[g]` and `:%s/old/new/[g]` — `whole_doc` is `%`, `global`
+    /// is the `g` flag (else only the first match per line/block). No
+    /// confirm (`c`) flag and no regex, like the ⌘F engine it reuses.
+    pub(super) fn vim_substitute(&mut self, whole_doc: bool, pat: &str, repl: &str, global: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let units = self.core.units();
+        let targets: Vec<BlockId> = if whole_doc {
+            units.iter().filter(|u| u.text).map(|u| u.id).collect()
+        } else {
+            vec![self.core.sel.head.block]
+        };
+        let mut hits: Vec<(BlockId, Range<usize>)> = vec![];
+        for id in targets {
+            let Some(t) = self.core.text_of(id) else { continue };
+            let mut found = find_in(t, pat);
+            if !global {
+                found.truncate(1);
+            }
+            hits.extend(found.into_iter().map(|r| (id, r)));
+        }
+        if hits.is_empty() {
+            return;
+        }
+        self.core.checkpoint(EditKind::Other);
+        // Back to front so an earlier replacement in the same block never
+        // invalidates a later one's byte offsets.
+        for (id, r) in hits.into_iter().rev() {
+            self.replace_range(id, r, repl);
+        }
+        self.after_replace(window, cx);
+    }
+
     fn replace_one(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some((id, r)) = self.find.as_ref().and_then(|f| f.matches.get(f.current?).cloned()) else { return };
         let with = self.replace_field.read(cx).text.clone();

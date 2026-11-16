@@ -369,6 +369,21 @@ fn from16(s: &str, o16: usize) -> usize {
     s.len()
 }
 
+/// Parse `:s/old/new/flags` or `:%s/old/new/flags` (only `/` as delimiter;
+/// an empty pattern or a `c` confirm flag are not supported — see the ex
+/// command line's doc comment). Returns `(whole_doc, old, new, global)`.
+fn parse_vim_substitute(cmd: &str) -> Option<(bool, String, String, bool)> {
+    let whole_doc = cmd.starts_with('%');
+    let rest = cmd.strip_prefix('%').unwrap_or(cmd);
+    let rest = rest.strip_prefix("substitute").or_else(|| rest.strip_prefix('s'))?;
+    let rest = rest.strip_prefix('/')?;
+    let mut parts = rest.splitn(3, '/');
+    let old = parts.next()?.to_string();
+    let new = parts.next().unwrap_or("").to_string();
+    let flags = parts.next().unwrap_or("");
+    (!old.is_empty()).then_some((whole_doc, old, new, flags.contains('g')))
+}
+
 fn looks_like_url(q: &str) -> bool {
     q.contains("://") || q.starts_with("www.") || (q.contains('@') && q.contains('.'))
 }
@@ -2711,6 +2726,10 @@ impl Editor {
     fn run_vim_command(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let cmd = self.vim_cmd.read(cx).text.trim().trim_start_matches(':').to_string();
         self.close_vim_command(window, cx);
+        if let Some((whole_doc, pat, repl, global)) = parse_vim_substitute(&cmd) {
+            self.vim_substitute(whole_doc, &pat, &repl, global, window, cx);
+            return;
+        }
         let (save, quit) = match cmd.as_str() {
             "w" | "write" => (true, false),
             "q" | "q!" | "quit" => (false, true),
