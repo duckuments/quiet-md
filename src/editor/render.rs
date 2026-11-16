@@ -1383,6 +1383,23 @@ impl Editor {
                 .child(":")
                 .child(div().flex_1().child(self.vim_cmd.clone()))
         });
+        // Vim `/`/`?` search prompt, same docking as the `:` bar above —
+        // deliberately not the ⌘F popover (`find_box` stands aside while open).
+        let vim_search_bar_el = self.vim_search_bar.then(|| {
+            let n = self.find.as_ref().map_or(0, |f| f.matches.len());
+            let counter = match self.find.as_ref().and_then(|f| f.current) {
+                Some(i) if n > 0 => format!("{} / {n}", i + 1),
+                _ => "0 / 0".to_string(),
+            };
+            div().absolute().bottom_0().left_0().right_0()
+                .flex().items_center().gap(px(6.))
+                .px(px(12.)).py(px(6.))
+                .bg(crate::theme::raised(Theme::bg_body())).border_t_1().border_color(Theme::line_border())
+                .text_color(Theme::text())
+                .child(self.vim_search_prefix.to_string())
+                .child(div().flex_1().child(self.find_field.clone()))
+                .child(div().text_size(px(12.)).text_color(Theme::text_caption()).child(counter))
+        });
         if std::mem::take(&mut self.autoscroll) && self.reveal.is_none() {
             self.reveal = Some((Reveal::Caret, 0));
         }
@@ -1688,6 +1705,7 @@ impl Editor {
             .children(counter)
             .children(find_box)
             .children(vim_cmd_bar)
+            .children(vim_search_bar_el)
             .children(lightbox)
             .children(toast)
             .child(root_canvas)

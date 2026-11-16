@@ -111,7 +111,8 @@ actions!(
         VimObjBracket,        // [ ]
         VimObjAngle,          // < >
         // Vim search, over the existing find engine (editor/find.rs).
-        VimSearchOpen,        // / ?
+        VimSearchOpen,        // /
+        VimSearchOpenBack,    // ?
         VimSearchNext,        // n
         VimSearchPrev,        // shift-n
         VimSearchWordFwd,     // * (and g *)
@@ -251,7 +252,7 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("shift-g", DocEnd, vn),
         // Search.
         KeyBinding::new("/", VimSearchOpen, vn),
-        KeyBinding::new("?", VimSearchOpen, vn),
+        KeyBinding::new("?", VimSearchOpenBack, vn),
         KeyBinding::new("n", VimSearchNext, vn),
         KeyBinding::new("shift-n", VimSearchPrev, vn),
         KeyBinding::new("*", VimSearchWordFwd, vn),

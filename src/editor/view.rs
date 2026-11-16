@@ -214,6 +214,17 @@ pub struct Editor {
     /// `i`/`a` pressed with an operator pending: `Some(around)` waits for the
     /// text-object key (`w`, `"`, `(`, …).
     pub(super) vim_textobj_pending: Option<bool>,
+    /// `/` or `?` was pressed: a bottom-docked prompt (reusing `find_field`
+    /// and the find engine) is open instead of the full find/replace popover.
+    pub(super) vim_search_bar: bool,
+    /// `self.find` was populated by a Vim command (`/` `?` `n` `N` `*` `#`),
+    /// not the real ⌘F — suppresses the popover for the rest of that search's
+    /// lifetime, even after `vim_search_bar` itself closes (`n`/`N` still
+    /// need `self.find` alive with no popover). Cleared by the real `open_find`.
+    pub(super) vim_search_quiet: bool,
+    /// `/` or `?`, whichever opened `vim_search_bar` (cosmetic only — both
+    /// search forward; see `vim_search_step`'s doc comment).
+    pub(super) vim_search_prefix: char,
     blink: Option<Task<()>>,
     pub goal_x: Option<Pixels>,
     /// The caret was placed on a wrap boundary from the row above: draw it at
@@ -555,6 +566,9 @@ impl Editor {
             vim_cmd,
             vim_cmd_open: false,
             vim_replace_pending: false,
+            vim_search_bar: false,
+            vim_search_quiet: false,
+            vim_search_prefix: '/',
             vim_pending_op: None,
             vim_textobj_pending: None,
             blink: None,
@@ -2450,12 +2464,51 @@ impl Editor {
         self.vim_apply_textobj(TextObj::Bracket('<', '>'), window, cx);
     }
 
-    /// `/` and `?`: open the find box (same engine as ⌘F). nvim's forward vs.
-    /// backward first-search distinction isn't modeled; use Shift+Enter or
-    /// `N` inside/after it to go backward.
+    /// `/` and `?`: a minimal bottom-docked prompt (not the ⌘F popover),
+    /// reusing `find_field` and the find engine. nvim's forward vs. backward
+    /// first-search distinction isn't modeled — both search forward; use `N`
+    /// afterward to go backward.
+    fn vim_open_search(&mut self, prefix: char, window: &mut Window, cx: &mut Context<Self>) {
+        self.vim_search_prefix = prefix;
+        self.vim_search_bar = true;
+        self.vim_search_quiet = true;
+        self.find = Some(super::find::Find { replace: false, matches: vec![], current: None });
+        self.slash = None;
+        self.menu = None;
+        self.find_field.update(cx, |f, cx| {
+            f.set_text("", cx);
+            f.size = 13.;
+            f.line_height = 20.;
+        });
+        self.refresh_find(true, cx);
+        let field = self.find_field.clone();
+        window.focus(&field.focus_handle(cx));
+        cx.notify();
+    }
+
     fn on_vim_search_open(&mut self, _: &k::VimSearchOpen, window: &mut Window, cx: &mut Context<Self>) {
         if !self.guard(window, cx) { return; }
-        self.open_find(false, window, cx);
+        self.vim_open_search('/', window, cx);
+    }
+    fn on_vim_search_open_back(&mut self, _: &k::VimSearchOpenBack, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.guard(window, cx) { return; }
+        self.vim_open_search('?', window, cx);
+    }
+
+    /// Enter in the search bar: close it and land the caret on the match
+    /// found while typing (the highlight and `find` state stay live for `n`/`N`).
+    pub(super) fn vim_search_confirm(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.vim_search_bar = false;
+        window.focus(&self.focus);
+        self.vim_search_jump(window, cx);
+    }
+
+    /// Esc in the search bar: cancel — no jump, no highlight, caret untouched.
+    pub(super) fn vim_search_cancel(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.vim_search_bar = false;
+        self.find = None;
+        window.focus(&self.focus);
+        cx.notify();
     }
 
     /// `n`/`N`: step through the last search and land the caret on the hit
@@ -2465,6 +2518,7 @@ impl Editor {
     fn vim_search_step(&mut self, forward: bool, window: &mut Window, cx: &mut Context<Self>) {
         if self.find.is_none() {
             if self.find_field.read(cx).text.is_empty() { return; }
+            self.vim_search_quiet = true;
             self.find = Some(super::find::Find { replace: false, matches: vec![], current: None });
             self.refresh_find(true, cx);
         }
@@ -2489,6 +2543,7 @@ impl Editor {
         let Some(word) = self.core.text_of(block).map(|t| t.text[range.clone()].to_string()) else { return };
         if word.trim().is_empty() { return; }
         self.find_field.update(cx, |f, cx| f.set_text(&word, cx));
+        self.vim_search_quiet = true;
         self.find = Some(super::find::Find { replace: false, matches: vec![], current: None });
         // Anchor just past the word (forward) or at its start (backward) so
         // the search always skips the occurrence the caret is already on.
@@ -3268,6 +3323,7 @@ impl Editor {
             .on_action(textobj_guard(cx, Self::on_vim_obj_bracket))
             .on_action(textobj_guard(cx, Self::on_vim_obj_angle))
             .on_action(guard(cx, Self::on_vim_search_open))
+            .on_action(guard(cx, Self::on_vim_search_open_back))
             .on_action(guard(cx, Self::on_vim_search_next))
             .on_action(guard(cx, Self::on_vim_search_prev))
             .on_action(guard(cx, Self::on_vim_search_word_fwd))

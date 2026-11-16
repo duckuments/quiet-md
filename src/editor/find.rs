@@ -49,6 +49,7 @@ const BTN_W: f32 = 80.;
 
 impl Editor {
     pub fn open_find(&mut self, replace: bool, window: &mut Window, cx: &mut Context<Self>) {
+        self.vim_search_quiet = false;
         // Seed the query with a single-line selection, like the browser find bar.
         let (a, b) = self.core.ordered();
         if !self.core.in_block_mode() && a.block == b.block && a.offset < b.offset {
@@ -205,6 +206,21 @@ impl Editor {
 
     pub(super) fn on_find_event(&mut self, ev: &crate::input::TextFieldEvent, window: &mut Window, cx: &mut Context<Self>) {
         use crate::input::TextFieldEvent as E;
+        // Vim `/`/`?`: a different prompt (vim_open_search), different
+        // Submit/Cancel — confirm jumps once and closes; the regular find
+        // box keeps stepping/open until explicitly dismissed.
+        if self.vim_search_bar {
+            match ev {
+                E::Changed => {
+                    self.refresh_find(true, cx);
+                    cx.notify();
+                }
+                E::Submit => self.vim_search_confirm(window, cx),
+                E::Cancel => self.vim_search_cancel(window, cx),
+                _ => {}
+            }
+            return;
+        }
         match ev {
             E::Changed => {
                 self.refresh_find(true, cx);
@@ -219,6 +235,9 @@ impl Editor {
     }
 
     pub(super) fn find_box(&self, window: &Window, cx: &mut Context<Self>) -> Option<AnyElement> {
+        if self.vim_search_quiet {
+            return None;
+        }
         let f = self.find.as_ref()?;
         let n = f.matches.len();
         let counter = match f.current {
