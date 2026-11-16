@@ -110,6 +110,12 @@ actions!(
         VimObjBrace,          // { } B
         VimObjBracket,        // [ ]
         VimObjAngle,          // < >
+        // Vim search, over the existing find engine (editor/find.rs).
+        VimSearchOpen,        // / ?
+        VimSearchNext,        // n
+        VimSearchPrev,        // shift-n
+        VimSearchWordFwd,     // * (and g *)
+        VimSearchWordBack,    // # (and g #)
     ]
 );
 
@@ -243,6 +249,15 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("$", LineEnd, vn),
         KeyBinding::new("g g", DocStart, vn),
         KeyBinding::new("shift-g", DocEnd, vn),
+        // Search.
+        KeyBinding::new("/", VimSearchOpen, vn),
+        KeyBinding::new("?", VimSearchOpen, vn),
+        KeyBinding::new("n", VimSearchNext, vn),
+        KeyBinding::new("shift-n", VimSearchPrev, vn),
+        KeyBinding::new("*", VimSearchWordFwd, vn),
+        KeyBinding::new("#", VimSearchWordBack, vn),
+        KeyBinding::new("g *", VimSearchWordFwd, vn),
+        KeyBinding::new("g #", VimSearchWordBack, vn),
         // Operators (then a motion; pressed twice = line-wise dd/cc/yy) and mode.
         KeyBinding::new("x", VimDeleteChar, vn),
         KeyBinding::new("d", VimOpDelete, vn),
