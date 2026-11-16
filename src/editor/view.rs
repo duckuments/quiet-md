@@ -2877,6 +2877,11 @@ impl Editor {
             // `changed` repaints the block caret). Leaving Visual clears the
             // selection.
             self.vim_to_normal();
+        } else if crate::settings::vim() && self.find.is_some() {
+            // Already in Normal: a second Esc clears the lingering Vim
+            // search highlight, instead of falling into 块选择模式 below
+            // (off while Vim is on — nvim's Esc never starts that).
+            self.find = None;
         } else if self.read_only {
             // Nothing to select blocks for.
             self.core.sel = Selection::caret(self.core.sel.head);
@@ -2884,7 +2889,10 @@ impl Editor {
             self.core.cell_sel = None;
         } else if self.core.in_block_mode() {
             self.core.clear_block_sel();
-        } else {
+        } else if !crate::settings::vim() {
+            // 块选择模式 ("move between lines" via repeated Esc): a
+            // non-Vim feature. With Vim on, Esc settles into Normal and
+            // stops there instead.
             let h = self.core.sel.head.block;
             self.core.select_block(h);
         }
