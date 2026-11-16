@@ -205,6 +205,10 @@ pub struct Editor {
     /// The `:` ex command line input; shown only while `vim_cmd_open`.
     pub(super) vim_cmd: Entity<TextField>,
     pub(super) vim_cmd_open: bool,
+    /// Live, uncommitted preview of a `:s`/`:%s` being typed in `vim_cmd` —
+    /// `None` outside the "typing the replacement" phase. Never touches the
+    /// undo stack (see `vim_sub_revert`); the real edit happens on Submit.
+    pub(super) vim_sub_preview: Option<VimSubPreview>,
     /// Vim `r` was pressed: the next typed character replaces the one under the
     /// caret (the key context drops `vim` for that keystroke so it reaches input).
     pub(super) vim_replace_pending: bool,
@@ -346,6 +350,44 @@ pub enum VimMode {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum VimOp { Delete, Change, Yank }
 
+/// A `:s`/`:%s` command as typed so far in `vim_cmd`, re-parsed on every
+/// keystroke. `/` is the only delimiter; see `vim_substitute`'s doc comment
+/// for the same limits that apply once the command is actually run.
+pub(super) enum VimSubLive {
+    /// No second `/` yet — still typing the pattern.
+    Pattern { whole_doc: bool, pat: String },
+    /// Second `/` seen — typing the replacement (`global` from any `g`
+    /// already typed in a, possibly still-growing, flags tail).
+    Replace { whole_doc: bool, pat: String, repl: String, global: bool },
+}
+
+/// `cmd` parses the same way whether it's complete (Submit) or partial
+/// (every keystroke) — only `Replace` is a valid final command.
+pub(super) fn parse_vim_substitute_live(cmd: &str) -> Option<VimSubLive> {
+    let whole_doc = cmd.starts_with('%');
+    let rest = cmd.strip_prefix('%').unwrap_or(cmd);
+    let rest = rest.strip_prefix("substitute").or_else(|| rest.strip_prefix('s'))?;
+    let rest = rest.strip_prefix('/')?;
+    Some(match rest.split_once('/') {
+        None => VimSubLive::Pattern { whole_doc, pat: rest.to_string() },
+        Some((pat, tail)) => {
+            let (repl, flags) = tail.split_once('/').unwrap_or((tail, ""));
+            VimSubLive::Replace { whole_doc, pat: pat.to_string(), repl: repl.to_string(), global: flags.contains('g') }
+        }
+    })
+}
+
+/// Pristine (pre-preview) text of each block a live `:s`/`:%s` touches, plus
+/// the pattern's match ranges in that text — frozen when the second `/` is
+/// typed, so only the replacement re-applies on later keystrokes.
+pub(super) struct VimSubPreview {
+    pub(super) whole_doc: bool,
+    pub(super) pat: String,
+    pub(super) originals: Vec<(BlockId, RichText, Vec<Range<usize>>)>,
+    /// `core.dirty` before the preview started; restored on revert.
+    pub(super) was_dirty: bool,
+}
+
 impl EventEmitter<EditorEvent> for Editor {}
 
 impl Focusable for Editor {
@@ -369,20 +411,6 @@ fn from16(s: &str, o16: usize) -> usize {
     s.len()
 }
 
-/// Parse `:s/old/new/flags` or `:%s/old/new/flags` (only `/` as delimiter;
-/// an empty pattern or a `c` confirm flag are not supported — see the ex
-/// command line's doc comment). Returns `(whole_doc, old, new, global)`.
-fn parse_vim_substitute(cmd: &str) -> Option<(bool, String, String, bool)> {
-    let whole_doc = cmd.starts_with('%');
-    let rest = cmd.strip_prefix('%').unwrap_or(cmd);
-    let rest = rest.strip_prefix("substitute").or_else(|| rest.strip_prefix('s'))?;
-    let rest = rest.strip_prefix('/')?;
-    let mut parts = rest.splitn(3, '/');
-    let old = parts.next()?.to_string();
-    let new = parts.next().unwrap_or("").to_string();
-    let flags = parts.next().unwrap_or("");
-    (!old.is_empty()).then_some((whole_doc, old, new, flags.contains('g')))
-}
 
 fn looks_like_url(q: &str) -> bool {
     q.contains("://") || q.starts_with("www.") || (q.contains('@') && q.contains('.'))
@@ -447,6 +475,7 @@ impl Editor {
                 |this, _, ev: &TextFieldEvent, window, cx| match ev {
                     TextFieldEvent::Submit => this.run_vim_command(window, cx),
                     TextFieldEvent::Cancel => this.close_vim_command(window, cx),
+                    TextFieldEvent::Changed => this.on_vim_cmd_changed(cx),
                     _ => {}
                 },
             ),
@@ -580,6 +609,7 @@ impl Editor {
             vim_mode: VimMode::Normal,
             vim_cmd,
             vim_cmd_open: false,
+            vim_sub_preview: None,
             vim_replace_pending: false,
             vim_search_bar: false,
             vim_search_quiet: false,
@@ -2715,19 +2745,60 @@ impl Editor {
         cx.notify();
     }
 
+    /// Closing the bar for any reason (Escape, Submit, losing focus) always
+    /// reverts a live substitute preview and drops its pattern highlight —
+    /// `run_vim_command` calls this *before* actually running the command,
+    /// so the real edit (if any) starts from a clean, un-previewed document.
     fn close_vim_command(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.vim_sub_revert(cx);
+        self.find = None;
         self.vim_cmd_open = false;
         window.focus(&self.focus);
         cx.notify();
     }
 
+    /// `vim_cmd`'s text changed: live-highlight a `:s`/`:%s` pattern while
+    /// it's being typed, then switch to a live, uncommitted preview of the
+    /// replacement once the second `/` appears (see `VimSubPreview`).
+    fn on_vim_cmd_changed(&mut self, cx: &mut Context<Self>) {
+        let cmd = self.vim_cmd.read(cx).text.clone();
+        match parse_vim_substitute_live(&cmd) {
+            Some(VimSubLive::Pattern { whole_doc, pat }) => {
+                self.vim_sub_revert(cx);
+                self.vim_sub_highlight_pattern(whole_doc, &pat, cx);
+            }
+            Some(VimSubLive::Replace { whole_doc, pat, repl, global }) => {
+                let stale = self.vim_sub_preview.as_ref().is_none_or(|p| p.whole_doc != whole_doc || p.pat != pat);
+                if stale {
+                    self.vim_sub_revert(cx);
+                    self.find = None;
+                    self.vim_sub_enter_replace(whole_doc, &pat, cx);
+                }
+                self.vim_sub_update_preview(&repl, global, cx);
+            }
+            None => {
+                self.vim_sub_revert(cx);
+                self.find = None;
+                cx.notify();
+            }
+        }
+    }
+
     /// Run an ex command: `:w` save, `:q`/`:q!` leave, `:wq`/`:x` both, `:<n>`
-    /// jump to the nth line. Unknown commands are ignored.
+    /// jump to the nth line, `:s`/`:%s` substitute. Unknown commands are ignored.
     fn run_vim_command(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let cmd = self.vim_cmd.read(cx).text.trim().trim_start_matches(':').to_string();
         self.close_vim_command(window, cx);
-        if let Some((whole_doc, pat, repl, global)) = parse_vim_substitute(&cmd) {
-            self.vim_substitute(whole_doc, &pat, &repl, global, window, cx);
+        if let Some(sub) = parse_vim_substitute_live(&cmd) {
+            // `:s/pat` with no closing slash at all is still valid vim —
+            // shorthand for "replace with nothing" — same as an explicit `//`.
+            let (whole_doc, pat, repl, global) = match sub {
+                VimSubLive::Replace { whole_doc, pat, repl, global } => (whole_doc, pat, repl, global),
+                VimSubLive::Pattern { whole_doc, pat } => (whole_doc, pat, String::new(), false),
+            };
+            if !pat.is_empty() {
+                self.vim_substitute(whole_doc, &pat, &repl, global, window, cx);
+            }
             return;
         }
         let (save, quit) = match cmd.as_str() {
