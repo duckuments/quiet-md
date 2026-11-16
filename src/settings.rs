@@ -294,13 +294,14 @@ pub(crate) fn watch_themes(cx: &mut Context<Workspace>) {
 // ---- the view
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum Page { #[default] General, Appearance, Shortcuts, Library, About }
+pub enum Page { #[default] General, Appearance, Editor, Shortcuts, Library, About }
 
 impl Page {
     fn title(self) -> &'static str {
         match self {
             Page::General => tr("通用", "General"),
             Page::Appearance => tr("外观", "Appearance"),
+            Page::Editor => tr("编辑器", "Editor"),
             Page::Shortcuts => tr("快捷键", "Shortcuts"),
             Page::Library => tr("文档库", "Documents"),
             Page::About => tr("关于", "About"),
@@ -310,6 +311,7 @@ impl Page {
         match self {
             Page::General => "view-settings",
             Page::Appearance => "palette",
+            Page::Editor => "code",
             Page::Shortcuts => "keyboard",
             Page::Library => "storage",
             Page::About => "info",
@@ -317,9 +319,9 @@ impl Page {
     }
 }
 
-/// The sidebar list, one evenly spaced run (six rows need no unlabelled
+/// The sidebar list, one evenly spaced run (seven rows need no unlabelled
 /// groups); `None` is 回收站 (its own view, shown with this sidebar).
-const NAV: [Option<Page>; 6] = [Some(Page::General), Some(Page::Appearance), Some(Page::Shortcuts), Some(Page::Library), None, Some(Page::About)];
+const NAV: [Option<Page>; 7] = [Some(Page::General), Some(Page::Appearance), Some(Page::Editor), Some(Page::Shortcuts), Some(Page::Library), None, Some(Page::About)];
 
 // ---- controls (switch on the accent, 30pt buttons, grouped rows)
 
@@ -820,6 +822,7 @@ impl Workspace {
         let body = match page {
             Page::General => self.general_page(cx),
             Page::Appearance => self.appearance_page(cx),
+            Page::Editor => self.editor_page(cx),
             Page::Shortcuts => self.shortcut_settings(cx),
             Page::Library => self.library_page(cx),
             Page::About => self.about_page(cx),
@@ -936,12 +939,6 @@ impl Workspace {
                             w.set_pref(|p| p.opaque_window = !p.opaque_window, cx);
                             window.refresh();
                         }))).into_any_element(),
-                    // Vim mode: modal editing with a block caret in Normal mode.
-                    row(tr("Vim mode", "Vim mode"), Some(tr("Edit the nvim way: Normal / Insert / Visual modes, Esc returns to Normal, and a block caret in Normal.", "Edit the nvim way: Normal / Insert / Visual modes, Esc returns to Normal, and a block caret in Normal.").into()),
-                        switch("pref-vim", prefs().vim).on_click(cx.listener(|w, _, window, cx| {
-                            w.set_pref(|p| p.vim = !p.vim, cx);
-                            window.refresh();
-                        }))).into_any_element(),
                     // 界面字号: the sidebar and this page together, so the pairs
                     // (label, description) stay in proportion.
                     row(tr("界面字号", "Interface size"), None, {
@@ -961,6 +958,19 @@ impl Workspace {
                 })).collect()))
                 .children(errors.into_iter().chain(warnings.into_iter().take(8).map(|w| format!("{}：{w}", tr("未生效", "Ignored")))).map(|e| div().px(px(4.)).text_size(px(theme::ui_font_small())).line_height(px(theme::ui_font_small() + 6.)).text_color(Theme::danger()).child(e)))
                 )
+            .into_any_element()
+    }
+
+    fn editor_page(&self, cx: &mut Context<Self>) -> AnyElement {
+        div().w_full().flex().flex_col().gap(px(28.))
+            .child(group(None, vec![
+                // Vim mode: modal editing with a block caret in Normal mode.
+                row(tr("Vim mode", "Vim mode"), Some(tr("Edit the nvim way: Normal / Insert / Visual modes, Esc returns to Normal, and a block caret in Normal.", "Edit the nvim way: Normal / Insert / Visual modes, Esc returns to Normal, and a block caret in Normal.").into()),
+                    switch("pref-vim", prefs().vim).on_click(cx.listener(|w, _, window, cx| {
+                        w.set_pref(|p| p.vim = !p.vim, cx);
+                        window.refresh();
+                    }))).into_any_element(),
+            ]))
             .into_any_element()
     }
 
