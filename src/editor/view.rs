@@ -2799,7 +2799,7 @@ impl Editor {
         } else if self.slash.is_some() || self.menu.is_some() {
             self.slash = None;
             self.menu = None;
-        } else if self.find.is_some() {
+        } else if self.find.is_some() && !self.vim_search_quiet {
             return self.close_find(window, cx);
         } else if crate::settings::vim() && self.vim_mode != VimMode::Normal {
             // Leave Insert/Visual for Normal, as Esc does in nvim (the tail
