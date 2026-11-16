@@ -117,6 +117,7 @@ actions!(
         VimSearchPrev,        // shift-n
         VimSearchWordFwd,     // * (and g *)
         VimSearchWordBack,    // # (and g #)
+        VimPaste,             // p (shape-aware: char / line / block)
     ]
 );
 
@@ -264,7 +265,7 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("d", VimOpDelete, vn),
         KeyBinding::new("c", VimOpChange, vn),
         KeyBinding::new("y", VimOpYank, vn),
-        KeyBinding::new("p", Paste, vn),
+        KeyBinding::new("p", VimPaste, vn),
         KeyBinding::new("u", Undo, vn),
         KeyBinding::new("v", VimVisual, vn),
         KeyBinding::new("shift-v", VimVisualLine, vn),

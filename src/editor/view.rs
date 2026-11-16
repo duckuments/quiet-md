@@ -14,6 +14,7 @@ use crate::theme;
 use gpui::*;
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::ops::Range;
 use std::rc::Rc;
 use std::time::Duration;
@@ -349,6 +350,27 @@ pub enum VimMode {
 /// A pending Vim operator (`d`/`c`/`y`) waiting for a motion to define its range.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum VimOp { Delete, Change, Yank }
+
+/// How the most recent Vim yank should be pasted back. The system clipboard
+/// (used for the actual text, so yank/paste still cross documents) carries
+/// no such distinction, so it's tracked separately here — global, same
+/// lifetime as the clipboard itself, not per-document.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum VimYankKind { Char, Line, Block }
+
+static VIM_YANK_KIND: AtomicU8 = AtomicU8::new(0);
+
+fn set_vim_yank_kind(k: VimYankKind) {
+    VIM_YANK_KIND.store(k as u8, Ordering::Relaxed);
+}
+
+fn vim_yank_kind() -> VimYankKind {
+    match VIM_YANK_KIND.load(Ordering::Relaxed) {
+        1 => VimYankKind::Line,
+        2 => VimYankKind::Block,
+        _ => VimYankKind::Char,
+    }
+}
 
 /// A `:s`/`:%s` command as typed so far in `vim_cmd`, re-parsed on every
 /// keystroke. `/` is the only delimiter; see `vim_substitute`'s doc comment
@@ -2439,6 +2461,7 @@ impl Editor {
         match op {
             VimOp::Yank => {
                 self.copy_selection(cx);
+                set_vim_yank_kind(VimYankKind::Char);
                 // nvim leaves the caret at the start of the yanked span.
                 self.core.sel = Selection::caret(self.core.ordered().0);
             }
@@ -2635,6 +2658,7 @@ impl Editor {
         let saved = self.core.sel;
         self.core.sel = Selection { anchor: Pos::new(h, 0), head: Pos::new(h, len) };
         self.copy_selection(cx);
+        set_vim_yank_kind(VimYankKind::Line);
         self.core.sel = saved;
         self.changed(window, cx);
     }
@@ -2725,6 +2749,7 @@ impl Editor {
     fn on_vim_visual_block_yank(&mut self, _: &k::VimVisualBlockYank, window: &mut Window, cx: &mut Context<Self>) {
         if !self.guard(window, cx) { return; }
         cx.write_to_clipboard(ClipboardItem::new_string(self.core.columns_text()));
+        set_vim_yank_kind(VimYankKind::Block);
         self.vim_to_normal();
         self.changed(window, cx);
     }
@@ -2841,7 +2866,9 @@ impl Editor {
 
     fn on_vim_visual_yank(&mut self, _: &k::VimVisualYank, window: &mut Window, cx: &mut Context<Self>) {
         if !self.guard(window, cx) { return; }
+        let line_wise = self.core.in_block_mode(); // Visual Line's backing store
         self.copy_selection(cx); // handles both block and charwise selections
+        set_vim_yank_kind(if line_wise { VimYankKind::Line } else { VimYankKind::Char });
         self.vim_to_normal();
         self.changed(window, cx);
     }
@@ -2995,6 +3022,38 @@ impl Editor {
     /// images win over their text fallback; plain text is read as Markdown.
     fn on_paste(&mut self, _: &k::Paste, window: &mut Window, cx: &mut Context<Self>) {
         self.paste(false, window, cx);
+    }
+
+    /// Vim `p`: paste according to how the content was yanked — a plain
+    /// paste at the caret (`VimYankKind::Char`, e.g. `yw`/`y$`), a new line
+    /// below (`yy`/Visual Line `y`), or a column-preserving rectangle
+    /// (Visual Block `y`). `d`/`c` don't set a yank kind (see
+    /// `VIM_YANK_KIND`'s doc comment) — deleting then pasting back is not
+    /// wired up, only yank is.
+    fn on_vim_paste(&mut self, _: &k::VimPaste, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.guard(window, cx) || self.core.in_block_mode() { return; }
+        match vim_yank_kind() {
+            VimYankKind::Char => self.paste(false, window, cx),
+            VimYankKind::Line => {
+                let after = self.core.sel.head.block;
+                self.core.checkpoint(core::EditKind::Other);
+                let b = Block::text("");
+                let id = b.id;
+                self.core.insert_after(after, b);
+                self.core.sel = Selection::caret(Pos::new(id, 0));
+                self.paste(false, window, cx);
+            }
+            VimYankKind::Block => {
+                // Honor the UI test harness's fake clipboard, like `paste()` does
+                // (tools/harness never touches the real system clipboard).
+                let fake = crate::clipboard::FAKE_CLIPBOARD.lock().unwrap().clone();
+                let Some(text) = fake.map(|f| f.text).or_else(|| cx.read_from_clipboard().and_then(|i| i.text())) else { return };
+                let lines: Vec<String> = text.lines().map(str::to_string).collect();
+                let col = self.core.sel.head.offset;
+                self.core.insert_columns(&lines, col);
+                self.changed(window, cx);
+            }
+        }
     }
 
     /// ⌘⇧V 粘贴为纯文本: the characters as they are, no Markdown parsing.
@@ -3426,6 +3485,7 @@ impl Editor {
             .on_action(guard(cx, Self::on_vim_search_prev))
             .on_action(guard(cx, Self::on_vim_search_word_fwd))
             .on_action(guard(cx, Self::on_vim_search_word_back))
+            .on_action(guard(cx, Self::on_vim_paste))
             .on_action(guard(cx, Self::on_vim_visual))
             .on_action(guard(cx, Self::on_vim_visual_line))
             .on_action(guard(cx, Self::on_vim_visual_block))

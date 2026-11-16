@@ -772,6 +772,36 @@ impl Core {
         }).collect::<Vec<_>>().join("\n")
     }
 
+    /// Vim Visual Block paste: insert `lines[i]` at byte-column `col` into
+    /// the i-th text unit at and below the caret's block — the inverse of
+    /// `columns_text`/`delete_columns`, so a yanked rectangle pastes back as
+    /// one. A row past the last unit is skipped: nvim never creates new
+    /// lines for a block paste.
+    pub fn insert_columns(&mut self, lines: &[String], col: usize) {
+        if lines.is_empty() {
+            return;
+        }
+        let units = self.units();
+        let Some(start) = self.unit_index(&units, self.sel.head.block) else { return };
+        let mut edited = false;
+        for (i, line) in lines.iter().enumerate() {
+            let Some(u) = units.get(start + i) else { break };
+            if !u.text {
+                continue;
+            }
+            let Some(t) = self.text_of(u.id) else { continue };
+            let at = floor_boundary(&t.text, col.min(t.len()));
+            if !edited {
+                self.checkpoint(EditKind::Other);
+                edited = true;
+            }
+            if let Some(t) = self.text_mut(u.id) {
+                t.replace(at..at, &RichText::plain(line));
+            }
+        }
+        self.fix_selection();
+    }
+
     /// Atomic blocks fully covered by the selection (rendered as selected).
     pub fn atomic_selected(&self, id: BlockId, units: &[Unit]) -> bool {
         let (s, e) = self.ordered_in(units);
