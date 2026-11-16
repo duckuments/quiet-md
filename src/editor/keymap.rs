@@ -84,8 +84,9 @@ actions!(
         OpenAbove,
         // Vim Normal operators (motions reuse the Move*/Word*/Line*/Doc* actions).
         VimDeleteChar,   // x
-        VimDeleteLine,   // dd
-        VimYankLine,     // yy
+        VimOpDelete,     // d (then a motion, or d again for dd)
+        VimOpChange,     // c
+        VimOpYank,       // y
         VimVisual,       // v (toggle charwise Visual)
         VimVisualLine,   // V (toggle line-wise Visual)
         VimVisualBlock,  // ctrl-v (toggle block-wise Visual)
@@ -230,10 +231,11 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("$", LineEnd, vn),
         KeyBinding::new("g g", DocStart, vn),
         KeyBinding::new("shift-g", DocEnd, vn),
-        // Operators and mode.
+        // Operators (then a motion; pressed twice = line-wise dd/cc/yy) and mode.
         KeyBinding::new("x", VimDeleteChar, vn),
-        KeyBinding::new("d d", VimDeleteLine, vn),
-        KeyBinding::new("y y", VimYankLine, vn),
+        KeyBinding::new("d", VimOpDelete, vn),
+        KeyBinding::new("c", VimOpChange, vn),
+        KeyBinding::new("y", VimOpYank, vn),
         KeyBinding::new("p", Paste, vn),
         KeyBinding::new("u", Undo, vn),
         KeyBinding::new("v", VimVisual, vn),

@@ -208,6 +208,9 @@ pub struct Editor {
     /// Vim `r` was pressed: the next typed character replaces the one under the
     /// caret (the key context drops `vim` for that keystroke so it reaches input).
     pub(super) vim_replace_pending: bool,
+    /// Pending operator (`d`/`c`/`y`) and the caret it was armed at; the next
+    /// motion defines the range it applies to.
+    pub(super) vim_pending_op: Option<(VimOp, Pos)>,
     blink: Option<Task<()>>,
     pub goal_x: Option<Pixels>,
     /// The caret was placed on a wrap boundary from the row above: draw it at
@@ -324,6 +327,10 @@ pub enum VimMode {
     /// Columnar selection: the same byte-column range on each covered line.
     VisualBlock,
 }
+
+/// A pending Vim operator (`d`/`c`/`y`) waiting for a motion to define its range.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum VimOp { Delete, Change, Yank }
 
 impl EventEmitter<EditorEvent> for Editor {}
 
@@ -545,6 +552,7 @@ impl Editor {
             vim_cmd,
             vim_cmd_open: false,
             vim_replace_pending: false,
+            vim_pending_op: None,
             blink: None,
             goal_x: None,
             caret_row_end: None,
@@ -2329,16 +2337,60 @@ impl Editor {
         self.on_delete(&k::Delete, window, cx);
     }
 
-    fn on_vim_delete_line(&mut self, _: &k::VimDeleteLine, window: &mut Window, cx: &mut Context<Self>) {
+    /// Arm operator `op`, or — if it is already armed — run its line-wise form
+    /// (`dd`/`cc`/`yy`, operator pressed twice).
+    fn vim_operator(&mut self, op: VimOp, window: &mut Window, cx: &mut Context<Self>) {
         if !self.guard(window, cx) || self.core.in_block_mode() { return; }
+        if matches!(self.vim_pending_op, Some((p, _)) if p == op) {
+            self.vim_pending_op = None;
+            match op {
+                VimOp::Delete => self.vim_delete_line(window, cx),
+                VimOp::Yank => self.vim_yank_line(window, cx),
+                VimOp::Change => self.vim_change_line(window, cx),
+            }
+        } else {
+            self.vim_pending_op = Some((op, self.core.sel.head));
+            cx.notify();
+        }
+    }
+
+    fn on_vim_op_delete(&mut self, _: &k::VimOpDelete, window: &mut Window, cx: &mut Context<Self>) {
+        self.vim_operator(VimOp::Delete, window, cx);
+    }
+    fn on_vim_op_change(&mut self, _: &k::VimOpChange, window: &mut Window, cx: &mut Context<Self>) {
+        self.vim_operator(VimOp::Change, window, cx);
+    }
+    fn on_vim_op_yank(&mut self, _: &k::VimOpYank, window: &mut Window, cx: &mut Context<Self>) {
+        self.vim_operator(VimOp::Yank, window, cx);
+    }
+
+    /// Apply a pending operator to the span from where it was armed (`anchor`)
+    /// to the motion's landing point (the current caret).
+    fn apply_vim_op(&mut self, op: VimOp, anchor: Pos, window: &mut Window, cx: &mut Context<Self>) {
+        self.core.sel = Selection { anchor, head: self.core.sel.head };
+        match op {
+            VimOp::Yank => {
+                self.copy_selection(cx);
+                // nvim leaves the caret at the start of the yanked span.
+                self.core.sel = Selection::caret(self.core.ordered().0);
+            }
+            VimOp::Delete => self.core.delete_selection(),
+            VimOp::Change => {
+                self.core.delete_selection();
+                self.vim_mode = VimMode::Insert;
+            }
+        }
+        self.changed(window, cx);
+    }
+
+    fn vim_delete_line(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let h = self.core.sel.head.block;
         if h == TITLE { return; } // keep the document title
         self.core.delete_block(h); // checkpoints and repositions the caret
         self.changed(window, cx);
     }
 
-    fn on_vim_yank_line(&mut self, _: &k::VimYankLine, window: &mut Window, cx: &mut Context<Self>) {
-        if !self.guard(window, cx) || self.core.in_block_mode() { return; }
+    fn vim_yank_line(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let h = self.core.sel.head.block;
         let Some(len) = self.core.text_of(h).map(|t| t.len()) else { return; };
         // Copy the whole line by selecting it, then restore the caret.
@@ -2346,6 +2398,16 @@ impl Editor {
         self.core.sel = Selection { anchor: Pos::new(h, 0), head: Pos::new(h, len) };
         self.copy_selection(cx);
         self.core.sel = saved;
+        self.changed(window, cx);
+    }
+
+    fn vim_change_line(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let h = self.core.sel.head.block;
+        let Some(len) = self.core.text_of(h).map(|t| t.len()) else { return; };
+        // Clear the line's text (keep the block) and drop into Insert.
+        self.core.sel = Selection { anchor: Pos::new(h, 0), head: Pos::new(h, len) };
+        self.core.delete_selection();
+        self.vim_mode = VimMode::Insert;
         self.changed(window, cx);
     }
 
@@ -3015,24 +3077,24 @@ impl Editor {
 
     /// Attach every editor action to the root element.
     pub fn register_actions(&self, d: Div, cx: &mut Context<Self>) -> Div {
-        d.on_action(guard(cx, Self::on_move_left))
-            .on_action(guard(cx, Self::on_move_right))
-            .on_action(guard(cx, Self::on_move_up))
-            .on_action(guard(cx, Self::on_move_down))
+        d.on_action(motion_guard(cx, Self::on_move_left))
+            .on_action(motion_guard(cx, Self::on_move_right))
+            .on_action(motion_guard(cx, Self::on_move_up))
+            .on_action(motion_guard(cx, Self::on_move_down))
             .on_action(guard(cx, Self::on_select_left))
             .on_action(guard(cx, Self::on_select_right))
             .on_action(guard(cx, Self::on_select_up))
             .on_action(guard(cx, Self::on_select_down))
-            .on_action(guard(cx, Self::on_word_left))
-            .on_action(guard(cx, Self::on_word_right))
+            .on_action(motion_guard(cx, Self::on_word_left))
+            .on_action(motion_guard(cx, Self::on_word_right))
             .on_action(guard(cx, Self::on_select_word_left))
             .on_action(guard(cx, Self::on_select_word_right))
-            .on_action(guard(cx, Self::on_line_start))
-            .on_action(guard(cx, Self::on_line_end))
+            .on_action(motion_guard(cx, Self::on_line_start))
+            .on_action(motion_guard(cx, Self::on_line_end))
             .on_action(guard(cx, Self::on_select_line_start))
             .on_action(guard(cx, Self::on_select_line_end))
-            .on_action(guard(cx, Self::on_doc_start))
-            .on_action(guard(cx, Self::on_doc_end))
+            .on_action(motion_guard(cx, Self::on_doc_start))
+            .on_action(motion_guard(cx, Self::on_doc_end))
             .on_action(guard(cx, Self::on_select_to_doc_start))
             .on_action(guard(cx, Self::on_select_to_doc_end))
             .on_action(edit_guard(cx, Self::on_backspace))
@@ -3053,8 +3115,9 @@ impl Editor {
             .on_action(guard(cx, Self::on_open_below))
             .on_action(guard(cx, Self::on_open_above))
             .on_action(guard(cx, Self::on_vim_delete_char))
-            .on_action(guard(cx, Self::on_vim_delete_line))
-            .on_action(guard(cx, Self::on_vim_yank_line))
+            .on_action(op_guard(cx, Self::on_vim_op_delete))
+            .on_action(op_guard(cx, Self::on_vim_op_change))
+            .on_action(op_guard(cx, Self::on_vim_op_yank))
             .on_action(guard(cx, Self::on_vim_visual))
             .on_action(guard(cx, Self::on_vim_visual_line))
             .on_action(guard(cx, Self::on_vim_visual_block))
@@ -3821,6 +3884,44 @@ fn guard<A: Action, F: Fn(&mut Editor, &A, &mut Window, &mut Context<Editor>) + 
     f: F,
 ) -> impl Fn(&A, &mut Window, &mut App) + 'static {
     cx.listener(move |e, a: &A, w, cx| {
+        // Any non-motion, non-operator action cancels a pending Vim operator.
+        e.vim_pending_op = None;
+        if e.cd.dialog.is_none() {
+            f(e, a, w, cx)
+        } else {
+            cx.propagate()
+        }
+    })
+}
+
+/// Like `guard`, but keeps a pending Vim operator alive and *applies* it once
+/// the wrapped motion has moved the caret (so `dw`/`y$`/… delete/yank the span
+/// from where the operator was armed to the motion's landing point).
+fn motion_guard<A: Action, F: Fn(&mut Editor, &A, &mut Window, &mut Context<Editor>) + 'static>(
+    cx: &mut Context<Editor>,
+    f: F,
+) -> impl Fn(&A, &mut Window, &mut App) + 'static {
+    cx.listener(move |e, a: &A, w, cx| {
+        if e.cd.dialog.is_some() {
+            return cx.propagate();
+        }
+        match e.vim_pending_op.take() {
+            Some((op, anchor)) => {
+                f(e, a, w, cx);
+                e.apply_vim_op(op, anchor, w, cx);
+            }
+            None => f(e, a, w, cx),
+        }
+    })
+}
+
+/// Like `guard`, but does **not** cancel a pending operator — used for the
+/// operator keys themselves so `dd`/`yy`/`cc` (operator pressed twice) work.
+fn op_guard<A: Action, F: Fn(&mut Editor, &A, &mut Window, &mut Context<Editor>) + 'static>(
+    cx: &mut Context<Editor>,
+    f: F,
+) -> impl Fn(&A, &mut Window, &mut App) + 'static {
+    cx.listener(move |e, a: &A, w, cx| {
         if e.cd.dialog.is_none() {
             f(e, a, w, cx)
         } else {
@@ -3837,6 +3938,7 @@ fn edit_guard<A: Action, F: Fn(&mut Editor, &A, &mut Window, &mut Context<Editor
     f: F,
 ) -> impl Fn(&A, &mut Window, &mut App) + 'static {
     cx.listener(move |e, a: &A, w, cx| {
+        e.vim_pending_op = None;
         if e.cd.dialog.is_some() {
             cx.propagate()
         } else if !e.vim_blocks_input() {
