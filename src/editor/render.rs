@@ -1626,7 +1626,16 @@ impl Editor {
                 VimMode::Visual | VimMode::VisualLine => "visual",
                 VimMode::VisualBlock => "visualblock",
             };
-            format!("Editor vim = {m}")
+            let mut ctx = format!("Editor vim = {m}");
+            // Pending `d`/`c`/`y` (and, within that, `i`/`a`) narrow what the
+            // next keystroke means — see the `vn_pending`/`vn_textobj` bindings.
+            if self.vim_pending_op.is_some() {
+                ctx.push_str(" pending");
+            }
+            if self.vim_textobj_pending.is_some() {
+                ctx.push_str(" textobj");
+            }
+            ctx
         } else { "Editor".to_string() };
         let root = div()
             .key_context(ctx.as_str())

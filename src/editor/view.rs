@@ -2,7 +2,7 @@
 //! platform input handler (typing / IME). Rendering lives in `render.rs` and
 //! the floating panels in `overlays.rs`.
 
-use super::core::{self, Core, Pos, Selection, TITLE};
+use super::core::{self, Core, Pos, Selection, TextObj, TITLE};
 use super::keymap as k;
 use super::menus::{self, SlashKind};
 use super::text::{LayoutCache, hit_test};
@@ -211,6 +211,9 @@ pub struct Editor {
     /// Pending operator (`d`/`c`/`y`) and the caret it was armed at; the next
     /// motion defines the range it applies to.
     pub(super) vim_pending_op: Option<(VimOp, Pos)>,
+    /// `i`/`a` pressed with an operator pending: `Some(around)` waits for the
+    /// text-object key (`w`, `"`, `(`, …).
+    pub(super) vim_textobj_pending: Option<bool>,
     blink: Option<Task<()>>,
     pub goal_x: Option<Pixels>,
     /// The caret was placed on a wrap boundary from the row above: draw it at
@@ -553,6 +556,7 @@ impl Editor {
             vim_cmd_open: false,
             vim_replace_pending: false,
             vim_pending_op: None,
+            vim_textobj_pending: None,
             blink: None,
             goal_x: None,
             caret_row_end: None,
@@ -2367,7 +2371,12 @@ impl Editor {
     /// Apply a pending operator to the span from where it was armed (`anchor`)
     /// to the motion's landing point (the current caret).
     fn apply_vim_op(&mut self, op: VimOp, anchor: Pos, window: &mut Window, cx: &mut Context<Self>) {
-        self.core.sel = Selection { anchor, head: self.core.sel.head };
+        self.apply_vim_op_to(op, Selection { anchor, head: self.core.sel.head }, window, cx);
+    }
+
+    /// Apply a pending operator to an explicit range (a text object's span).
+    fn apply_vim_op_to(&mut self, op: VimOp, sel: Selection, window: &mut Window, cx: &mut Context<Self>) {
+        self.core.sel = sel;
         match op {
             VimOp::Yank => {
                 self.copy_selection(cx);
@@ -2381,6 +2390,64 @@ impl Editor {
             }
         }
         self.changed(window, cx);
+    }
+
+    fn on_vim_textobj_inner(&mut self, _: &k::VimTextObjInner, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.guard(window, cx) || self.vim_pending_op.is_none() { return; }
+        self.vim_textobj_pending = Some(false);
+        cx.notify();
+    }
+    fn on_vim_textobj_around(&mut self, _: &k::VimTextObjAround, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.guard(window, cx) || self.vim_pending_op.is_none() { return; }
+        self.vim_textobj_pending = Some(true);
+        cx.notify();
+    }
+
+    /// Resolve text object `obj` at the caret and apply the pending operator
+    /// to it, ending both the operator and the text-object wait.
+    fn vim_apply_textobj(&mut self, obj: TextObj, window: &mut Window, cx: &mut Context<Self>) {
+        let (Some(around), Some((op, _))) = (self.vim_textobj_pending.take(), self.vim_pending_op.take()) else { return; };
+        let block = self.core.sel.head.block;
+        let Some(range) = self.core.text_object(obj, around) else { return; };
+        let sel = Selection { anchor: Pos::new(block, range.start), head: Pos::new(block, range.end) };
+        self.apply_vim_op_to(op, sel, window, cx);
+    }
+
+    fn on_vim_obj_word(&mut self, _: &k::VimObjWord, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.guard(window, cx) { return; }
+        self.vim_apply_textobj(TextObj::Word, window, cx);
+    }
+    fn on_vim_obj_para(&mut self, _: &k::VimObjPara, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.guard(window, cx) { return; }
+        self.vim_apply_textobj(TextObj::Para, window, cx);
+    }
+    fn on_vim_obj_quote_d(&mut self, _: &k::VimObjQuoteD, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.guard(window, cx) { return; }
+        self.vim_apply_textobj(TextObj::Quote('"'), window, cx);
+    }
+    fn on_vim_obj_quote_s(&mut self, _: &k::VimObjQuoteS, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.guard(window, cx) { return; }
+        self.vim_apply_textobj(TextObj::Quote('\''), window, cx);
+    }
+    fn on_vim_obj_quote_bt(&mut self, _: &k::VimObjQuoteBt, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.guard(window, cx) { return; }
+        self.vim_apply_textobj(TextObj::Quote('`'), window, cx);
+    }
+    fn on_vim_obj_paren(&mut self, _: &k::VimObjParen, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.guard(window, cx) { return; }
+        self.vim_apply_textobj(TextObj::Bracket('(', ')'), window, cx);
+    }
+    fn on_vim_obj_brace(&mut self, _: &k::VimObjBrace, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.guard(window, cx) { return; }
+        self.vim_apply_textobj(TextObj::Bracket('{', '}'), window, cx);
+    }
+    fn on_vim_obj_bracket(&mut self, _: &k::VimObjBracket, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.guard(window, cx) { return; }
+        self.vim_apply_textobj(TextObj::Bracket('[', ']'), window, cx);
+    }
+    fn on_vim_obj_angle(&mut self, _: &k::VimObjAngle, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.guard(window, cx) { return; }
+        self.vim_apply_textobj(TextObj::Bracket('<', '>'), window, cx);
     }
 
     fn vim_delete_line(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -3118,6 +3185,17 @@ impl Editor {
             .on_action(op_guard(cx, Self::on_vim_op_delete))
             .on_action(op_guard(cx, Self::on_vim_op_change))
             .on_action(op_guard(cx, Self::on_vim_op_yank))
+            .on_action(op_guard(cx, Self::on_vim_textobj_inner))
+            .on_action(op_guard(cx, Self::on_vim_textobj_around))
+            .on_action(textobj_guard(cx, Self::on_vim_obj_word))
+            .on_action(textobj_guard(cx, Self::on_vim_obj_para))
+            .on_action(textobj_guard(cx, Self::on_vim_obj_quote_d))
+            .on_action(textobj_guard(cx, Self::on_vim_obj_quote_s))
+            .on_action(textobj_guard(cx, Self::on_vim_obj_quote_bt))
+            .on_action(textobj_guard(cx, Self::on_vim_obj_paren))
+            .on_action(textobj_guard(cx, Self::on_vim_obj_brace))
+            .on_action(textobj_guard(cx, Self::on_vim_obj_bracket))
+            .on_action(textobj_guard(cx, Self::on_vim_obj_angle))
             .on_action(guard(cx, Self::on_vim_visual))
             .on_action(guard(cx, Self::on_vim_visual_line))
             .on_action(guard(cx, Self::on_vim_visual_block))
@@ -3884,8 +3962,10 @@ fn guard<A: Action, F: Fn(&mut Editor, &A, &mut Window, &mut Context<Editor>) + 
     f: F,
 ) -> impl Fn(&A, &mut Window, &mut App) + 'static {
     cx.listener(move |e, a: &A, w, cx| {
-        // Any non-motion, non-operator action cancels a pending Vim operator.
+        // Any non-motion, non-operator action cancels a pending Vim operator
+        // (and the `i`/`a` text-object wait it may have armed).
         e.vim_pending_op = None;
+        e.vim_textobj_pending = None;
         if e.cd.dialog.is_none() {
             f(e, a, w, cx)
         } else {
@@ -3905,6 +3985,8 @@ fn motion_guard<A: Action, F: Fn(&mut Editor, &A, &mut Window, &mut Context<Edit
         if e.cd.dialog.is_some() {
             return cx.propagate();
         }
+        // A plain motion (not an object key) ends any text-object wait.
+        e.vim_textobj_pending = None;
         match e.vim_pending_op.take() {
             Some((op, anchor)) => {
                 f(e, a, w, cx);
@@ -3917,7 +3999,25 @@ fn motion_guard<A: Action, F: Fn(&mut Editor, &A, &mut Window, &mut Context<Edit
 
 /// Like `guard`, but does **not** cancel a pending operator — used for the
 /// operator keys themselves so `dd`/`yy`/`cc` (operator pressed twice) work.
+/// Still ends a text-object wait: `d` right after `di` is not a valid object.
 fn op_guard<A: Action, F: Fn(&mut Editor, &A, &mut Window, &mut Context<Editor>) + 'static>(
+    cx: &mut Context<Editor>,
+    f: F,
+) -> impl Fn(&A, &mut Window, &mut App) + 'static {
+    cx.listener(move |e, a: &A, w, cx| {
+        e.vim_textobj_pending = None;
+        if e.cd.dialog.is_none() {
+            f(e, a, w, cx)
+        } else {
+            cx.propagate()
+        }
+    })
+}
+
+/// For the text-object key itself (`w`, `"`, `(`, …): touches neither pending
+/// state, since the handler needs to read `vim_textobj_pending` (the `around`
+/// flag) before deciding how to clear it.
+fn textobj_guard<A: Action, F: Fn(&mut Editor, &A, &mut Window, &mut Context<Editor>) + 'static>(
     cx: &mut Context<Editor>,
     f: F,
 ) -> impl Fn(&A, &mut Window, &mut App) + 'static {
@@ -3939,6 +4039,7 @@ fn edit_guard<A: Action, F: Fn(&mut Editor, &A, &mut Window, &mut Context<Editor
 ) -> impl Fn(&A, &mut Window, &mut App) + 'static {
     cx.listener(move |e, a: &A, w, cx| {
         e.vim_pending_op = None;
+        e.vim_textobj_pending = None;
         if e.cd.dialog.is_some() {
             cx.propagate()
         } else if !e.vim_blocks_input() {

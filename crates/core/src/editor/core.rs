@@ -300,6 +300,103 @@ pub fn prev_word(s: &str, offset: usize) -> usize {
     last
 }
 
+/// Vim text objects (`iw`, `a"`, `ib`, …). All scoped to the current block's
+/// text — a block is this app's paragraph, so there is no cross-block object.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TextObj {
+    /// `iw`/`aw`.
+    Word,
+    /// `ip`/`ap`: the whole block (a block has no interior blank lines to split on).
+    Para,
+    /// `i"`/`a"`, `i'`/`a'`, `` i` ``/`` a` ``.
+    Quote(char),
+    /// `ib`/`i(`/`i)`, `iB`/`i{`/`i}`, `i[`/`i]`, `i<`/`i>`.
+    Bracket(char, char),
+}
+
+/// Word/whitespace run under `offset` (`iw`); `around` extends it to include
+/// one side of adjoining whitespace (`aw`), as nvim does.
+fn word_object(s: &str, offset: usize, around: bool) -> Option<Range<usize>> {
+    let bounds: Vec<(usize, &str)> = s.split_word_bound_indices().collect();
+    let idx = bounds.iter().position(|(i, w)| offset >= *i && offset < *i + w.len())?;
+    let (i0, w0) = bounds[idx];
+    let inner = i0..i0 + w0.len();
+    if !around {
+        return Some(inner);
+    }
+    let is_space = |w: &str| w.trim().is_empty();
+    if let Some((i1, w1)) = bounds.get(idx + 1)
+        && is_space(w1)
+    {
+        return Some(i0..i1 + w1.len());
+    }
+    if idx > 0 {
+        let (ip, wp) = bounds[idx - 1];
+        if is_space(wp) {
+            return Some(ip..inner.end);
+        }
+    }
+    Some(inner)
+}
+
+/// The quote pair (char `q`) enclosing `offset`, or the nearest pair after it
+/// on the line if the caret sits outside any pair (nvim's quote-object rule).
+fn quote_object(s: &str, offset: usize, q: char) -> Option<(usize, usize)> {
+    let bytes = s.as_bytes();
+    let positions: Vec<usize> = s
+        .char_indices()
+        .filter(|&(i, c)| c == q && (i == 0 || bytes[i - 1] != b'\\'))
+        .map(|(i, _)| i)
+        .collect();
+    let mut fallback = None;
+    for &[open, close] in positions.as_chunks::<2>().0 {
+        if open <= offset && offset <= close {
+            return Some((open, close));
+        }
+        if open >= offset && fallback.is_none() {
+            fallback = Some((open, close));
+        }
+    }
+    fallback
+}
+
+/// The innermost `open`/`close` pair enclosing `offset`, by a balanced scan
+/// (supports nesting), or `None` if `offset` is outside any pair.
+fn bracket_object(s: &str, offset: usize, open: char, close: char) -> Option<(usize, usize)> {
+    let mut depth = 0i32;
+    let mut open_pos = None;
+    for (i, c) in s.char_indices().rev() {
+        if i > offset {
+            continue;
+        }
+        if c == close {
+            depth += 1;
+        } else if c == open {
+            if depth == 0 {
+                open_pos = Some(i);
+                break;
+            }
+            depth -= 1;
+        }
+    }
+    let open_pos = open_pos?;
+    let mut depth = 0i32;
+    let mut close_pos = None;
+    for (j, c) in s[open_pos + open.len_utf8()..].char_indices() {
+        let i = j + open_pos + open.len_utf8();
+        if c == open {
+            depth += 1;
+        } else if c == close {
+            if depth == 0 {
+                close_pos = Some(i);
+                break;
+            }
+            depth -= 1;
+        }
+    }
+    Some((open_pos, close_pos?))
+}
+
 pub fn next_word(s: &str, offset: usize) -> usize {
     for (i, w) in s.split_word_bound_indices() {
         let end = i + w.len();
@@ -590,6 +687,24 @@ impl Core {
             t.replace(p.offset..end, &RichText::plain(s));
         }
         self.sel = Selection::caret(p);
+    }
+
+    /// Resolve a Vim text object at the caret, in its block's own text.
+    pub fn text_object(&self, obj: TextObj, around: bool) -> Option<Range<usize>> {
+        let p = self.sel.head;
+        let s = &self.text_of(p.block)?.text;
+        match obj {
+            TextObj::Para => Some(0..s.len()),
+            TextObj::Word => word_object(s, p.offset, around),
+            TextObj::Quote(q) => {
+                let (open, close) = quote_object(s, p.offset, q)?;
+                Some(if around { open..close + q.len_utf8() } else { open + q.len_utf8()..close })
+            }
+            TextObj::Bracket(open_ch, close_ch) => {
+                let (open, close) = bracket_object(s, p.offset, open_ch, close_ch)?;
+                Some(if around { open..close + close_ch.len_utf8() } else { open + open_ch.len_utf8()..close })
+            }
+        }
     }
 
     /// Visual Block column range within block `id`: the same byte-column span

@@ -98,6 +98,18 @@ actions!(
         VimBlockUp,           // k in Visual Block (column-preserving)
         VimReplace,           // r (replace the char under the caret)
         VimCommand,           // : (ex command line)
+        // Vim text objects: `i`/`a` after an operator wait for the object key.
+        VimTextObjInner,      // i (after d/c/y)
+        VimTextObjAround,     // a (after d/c/y)
+        VimObjWord,           // w
+        VimObjPara,           // p
+        VimObjQuoteD,         // "
+        VimObjQuoteS,         // '
+        VimObjQuoteBt,        // `
+        VimObjParen,          // ( ) b
+        VimObjBrace,          // { } B
+        VimObjBracket,        // [ ]
+        VimObjAngle,          // < >
     ]
 );
 
@@ -245,6 +257,36 @@ pub fn bind_keys(cx: &mut App) {
         // ctrl-v (cmd-v, PC-mapped to ctrl-v) enters Visual Block; in Insert or
         // with Vim off it falls through to the Editor binding and pastes.
         KeyBinding::new("cmd-v", VimVisualBlock, vn),
+    ]);
+
+    // Vim text objects: `i`/`a` only mean "inner"/"around" while an operator
+    // is pending (render.rs adds `pending` to the context then); these are
+    // registered after `vn` so they win the tie (same depth, later wins) and
+    // override `i`→InsertHere / `a`→InsertAfter / `w`→WordRight / `p`→Paste /
+    // `b`→WordLeft for that one keystroke. Off the pending path, `vn`'s own
+    // bindings still win (the extra `&&` clause fails to match).
+    let vn_pending = Some("Editor && vim == normal && pending");
+    cx.bind_keys([
+        KeyBinding::new("i", VimTextObjInner, vn_pending),
+        KeyBinding::new("a", VimTextObjAround, vn_pending),
+    ]);
+    let vn_textobj = Some("Editor && vim == normal && pending && textobj");
+    cx.bind_keys([
+        KeyBinding::new("w", VimObjWord, vn_textobj),
+        KeyBinding::new("p", VimObjPara, vn_textobj),
+        KeyBinding::new("\"", VimObjQuoteD, vn_textobj),
+        KeyBinding::new("'", VimObjQuoteS, vn_textobj),
+        KeyBinding::new("`", VimObjQuoteBt, vn_textobj),
+        KeyBinding::new("(", VimObjParen, vn_textobj),
+        KeyBinding::new(")", VimObjParen, vn_textobj),
+        KeyBinding::new("b", VimObjParen, vn_textobj),
+        KeyBinding::new("{", VimObjBrace, vn_textobj),
+        KeyBinding::new("}", VimObjBrace, vn_textobj),
+        KeyBinding::new("shift-b", VimObjBrace, vn_textobj),
+        KeyBinding::new("[", VimObjBracket, vn_textobj),
+        KeyBinding::new("]", VimObjBracket, vn_textobj),
+        KeyBinding::new("<", VimObjAngle, vn_textobj),
+        KeyBinding::new(">", VimObjAngle, vn_textobj),
     ]);
 
     // Vim Visual mode: motions extend the selection; d/y act on it then exit.
