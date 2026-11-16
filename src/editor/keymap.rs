@@ -75,6 +75,52 @@ actions!(
         AlignRight,
         MoveBlockUp,
         MoveBlockDown,
+        // Vim: enter Insert mode from Normal (behave like nvim's i/a/I/A/o/O).
+        InsertHere,
+        InsertAfter,
+        InsertLineStart,
+        InsertLineEnd,
+        OpenBelow,
+        OpenAbove,
+        // Vim Normal operators (motions reuse the Move*/Word*/Line*/Doc* actions).
+        VimDeleteChar,   // x
+        VimOpDelete,     // d (then a motion, or d again for dd)
+        VimOpChange,     // c
+        VimOpYank,       // y
+        VimVisual,       // v (toggle charwise Visual)
+        VimVisualLine,   // V (toggle line-wise Visual)
+        VimVisualBlock,  // ctrl-v (toggle block-wise Visual)
+        VimVisualDelete, // d / x in Visual
+        VimVisualYank,   // y in Visual
+        VimVisualBlockDelete, // d / x in Visual Block
+        VimVisualBlockYank,   // y in Visual Block
+        VimBlockDown,         // j in Visual Block (column-preserving)
+        VimBlockUp,           // k in Visual Block (column-preserving)
+        VimReplace,           // r (replace the char under the caret)
+        VimMarkSet,           // m{a-z} (record the caret under a name)
+        VimMarkJumpExact,     // `{a-z} (jump to the exact mark)
+        VimMarkJumpLine,      // '{a-z} (jump to the mark's line start)
+        VimCommand,           // : (ex command line)
+        // Vim text objects: `i`/`a` after an operator wait for the object key.
+        VimTextObjInner,      // i (after d/c/y)
+        VimTextObjAround,     // a (after d/c/y)
+        VimObjWord,           // w
+        VimObjPara,           // p
+        VimObjQuoteD,         // "
+        VimObjQuoteS,         // '
+        VimObjQuoteBt,        // `
+        VimObjParen,          // ( ) b
+        VimObjBrace,          // { } B
+        VimObjBracket,        // [ ]
+        VimObjAngle,          // < >
+        // Vim search, over the existing find engine (editor/find.rs).
+        VimSearchOpen,        // /
+        VimSearchOpenBack,    // ?
+        VimSearchNext,        // n
+        VimSearchPrev,        // shift-n
+        VimSearchWordFwd,     // * (and g *)
+        VimSearchWordBack,    // # (and g #)
+        VimPaste,             // p (shape-aware: char / line / block)
     ]
 );
 
@@ -178,5 +224,135 @@ pub fn bind_keys(cx: &mut App) {
     ]);
     // PC clipboard keys (Ctrl+Insert after `shortcuts::pc_binding`).
     #[cfg(not(target_os = "macos"))]
-    cx.bind_keys([KeyBinding::new("shift-delete", Cut, c), KeyBinding::new("cmd-insert", Copy, c), KeyBinding::new("shift-insert", Paste, c)]);
+    cx.bind_keys([
+        KeyBinding::new("shift-delete", Cut, c),
+        KeyBinding::new("cmd-insert", Copy, c),
+        KeyBinding::new("shift-insert", Paste, c),
+    ]);
+
+    // Vim Normal mode: letters are commands. These bindings only match when the
+    // editor's key context carries `vim = normal` (set in render.rs when the
+    // Vim-mode setting is on), so default editing is untouched when it is off.
+    let vn = Some("Editor && vim == normal");
+    cx.bind_keys([
+        // Enter Insert.
+        KeyBinding::new("i", InsertHere, vn),
+        KeyBinding::new("a", InsertAfter, vn),
+        KeyBinding::new("shift-i", InsertLineStart, vn),
+        KeyBinding::new("shift-a", InsertLineEnd, vn),
+        KeyBinding::new("o", OpenBelow, vn),
+        KeyBinding::new("shift-o", OpenAbove, vn),
+        // Motions (reuse the existing caret actions).
+        KeyBinding::new("h", MoveLeft, vn),
+        KeyBinding::new("l", MoveRight, vn),
+        KeyBinding::new("j", MoveDown, vn),
+        KeyBinding::new("k", MoveUp, vn),
+        KeyBinding::new("w", WordRight, vn),
+        KeyBinding::new("b", WordLeft, vn),
+        KeyBinding::new("e", WordRight, vn),
+        KeyBinding::new("0", LineStart, vn),
+        KeyBinding::new("$", LineEnd, vn),
+        KeyBinding::new("g g", DocStart, vn),
+        KeyBinding::new("shift-g", DocEnd, vn),
+        // Search.
+        KeyBinding::new("/", VimSearchOpen, vn),
+        KeyBinding::new("?", VimSearchOpenBack, vn),
+        KeyBinding::new("n", VimSearchNext, vn),
+        KeyBinding::new("shift-n", VimSearchPrev, vn),
+        KeyBinding::new("*", VimSearchWordFwd, vn),
+        KeyBinding::new("#", VimSearchWordBack, vn),
+        KeyBinding::new("g *", VimSearchWordFwd, vn),
+        KeyBinding::new("g #", VimSearchWordBack, vn),
+        // Operators (then a motion; pressed twice = line-wise dd/cc/yy) and mode.
+        KeyBinding::new("x", VimDeleteChar, vn),
+        KeyBinding::new("d", VimOpDelete, vn),
+        KeyBinding::new("c", VimOpChange, vn),
+        KeyBinding::new("y", VimOpYank, vn),
+        KeyBinding::new("p", VimPaste, vn),
+        KeyBinding::new("u", Undo, vn),
+        KeyBinding::new("v", VimVisual, vn),
+        KeyBinding::new("shift-v", VimVisualLine, vn),
+        KeyBinding::new("r", VimReplace, vn),
+        KeyBinding::new("m", VimMarkSet, vn),
+        KeyBinding::new("`", VimMarkJumpExact, vn),
+        KeyBinding::new("'", VimMarkJumpLine, vn),
+        KeyBinding::new(":", VimCommand, vn),
+        // ctrl-v (cmd-v, PC-mapped to ctrl-v) enters Visual Block; in Insert or
+        // with Vim off it falls through to the Editor binding and pastes.
+        KeyBinding::new("cmd-v", VimVisualBlock, vn),
+    ]);
+
+    // Vim text objects: `i`/`a` only mean "inner"/"around" while an operator
+    // is pending (render.rs adds `pending` to the context then); these are
+    // registered after `vn` so they win the tie (same depth, later wins) and
+    // override `i`→InsertHere / `a`→InsertAfter / `w`→WordRight / `p`→Paste /
+    // `b`→WordLeft for that one keystroke. Off the pending path, `vn`'s own
+    // bindings still win (the extra `&&` clause fails to match).
+    let vn_pending = Some("Editor && vim == normal && pending");
+    cx.bind_keys([
+        KeyBinding::new("i", VimTextObjInner, vn_pending),
+        KeyBinding::new("a", VimTextObjAround, vn_pending),
+    ]);
+    let vn_textobj = Some("Editor && vim == normal && pending && textobj");
+    cx.bind_keys([
+        KeyBinding::new("w", VimObjWord, vn_textobj),
+        KeyBinding::new("p", VimObjPara, vn_textobj),
+        KeyBinding::new("\"", VimObjQuoteD, vn_textobj),
+        KeyBinding::new("'", VimObjQuoteS, vn_textobj),
+        KeyBinding::new("`", VimObjQuoteBt, vn_textobj),
+        KeyBinding::new("(", VimObjParen, vn_textobj),
+        KeyBinding::new(")", VimObjParen, vn_textobj),
+        KeyBinding::new("b", VimObjParen, vn_textobj),
+        KeyBinding::new("{", VimObjBrace, vn_textobj),
+        KeyBinding::new("}", VimObjBrace, vn_textobj),
+        KeyBinding::new("shift-b", VimObjBrace, vn_textobj),
+        KeyBinding::new("[", VimObjBracket, vn_textobj),
+        KeyBinding::new("]", VimObjBracket, vn_textobj),
+        KeyBinding::new("<", VimObjAngle, vn_textobj),
+        KeyBinding::new(">", VimObjAngle, vn_textobj),
+    ]);
+
+    // Vim Visual mode: motions extend the selection; d/y act on it then exit.
+    let vv = Some("Editor && vim == visual");
+    cx.bind_keys([
+        KeyBinding::new("h", SelectLeft, vv),
+        KeyBinding::new("l", SelectRight, vv),
+        KeyBinding::new("j", SelectDown, vv),
+        KeyBinding::new("k", SelectUp, vv),
+        KeyBinding::new("w", SelectWordRight, vv),
+        KeyBinding::new("b", SelectWordLeft, vv),
+        KeyBinding::new("e", SelectWordRight, vv),
+        KeyBinding::new("0", SelectLineStart, vv),
+        KeyBinding::new("$", SelectLineEnd, vv),
+        KeyBinding::new("g g", SelectToDocStart, vv),
+        KeyBinding::new("shift-g", SelectToDocEnd, vv),
+        KeyBinding::new("d", VimVisualDelete, vv),
+        KeyBinding::new("x", VimVisualDelete, vv),
+        KeyBinding::new("y", VimVisualYank, vv),
+        KeyBinding::new("v", VimVisual, vv),
+        KeyBinding::new("shift-v", VimVisualLine, vv),
+        KeyBinding::new("cmd-v", VimVisualBlock, vv),
+    ]);
+
+    // Vim Visual Block: motions grow a columnar selection; d/y act on the
+    // rectangle. The paste shortcut (ctrl-v) toggles the mode back off.
+    let vb = Some("Editor && vim == visualblock");
+    cx.bind_keys([
+        KeyBinding::new("h", SelectLeft, vb),
+        KeyBinding::new("l", SelectRight, vb),
+        // Column-preserving vertical motion (not SelectDown/Up, which jump to
+        // the line edge and then into whole-block selection).
+        KeyBinding::new("j", VimBlockDown, vb),
+        KeyBinding::new("k", VimBlockUp, vb),
+        KeyBinding::new("w", SelectWordRight, vb),
+        KeyBinding::new("b", SelectWordLeft, vb),
+        KeyBinding::new("0", SelectLineStart, vb),
+        KeyBinding::new("$", SelectLineEnd, vb),
+        KeyBinding::new("d", VimVisualBlockDelete, vb),
+        KeyBinding::new("x", VimVisualBlockDelete, vb),
+        KeyBinding::new("y", VimVisualBlockYank, vb),
+        KeyBinding::new("v", VimVisual, vb),
+        KeyBinding::new("shift-v", VimVisualLine, vb),
+        KeyBinding::new("cmd-v", VimVisualBlock, vb),
+    ]);
 }

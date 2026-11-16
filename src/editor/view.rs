@@ -2,18 +2,19 @@
 //! platform input handler (typing / IME). Rendering lives in `render.rs` and
 //! the floating panels in `overlays.rs`.
 
-use super::core::{self, Core, Pos, Selection, TITLE};
+use super::core::{self, Core, Pos, Selection, TextObj, TITLE};
 use super::keymap as k;
 use super::menus::{self, SlashKind};
 use super::text::{LayoutCache, hit_test};
 use crate::docxml;
-use crate::theme;
 use crate::input::{TextField, TextFieldEvent};
 use crate::model::*;
 use crate::store::PageWidth;
+use crate::theme;
 use gpui::*;
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::ops::Range;
 use std::rc::Rc;
 use std::time::Duration;
@@ -73,41 +74,79 @@ pub enum BlockSub {
 #[derive(Clone, Debug, PartialEq)]
 pub enum Menu {
     /// "+" on an empty line: slash items without a trigger.
-    Add { block: BlockId, selected: usize },
+    Add {
+        block: BlockId,
+        selected: usize,
+    },
     /// Handle click.
-    Block { block: BlockId, sub: Option<BlockSub> },
+    Block {
+        block: BlockId,
+        sub: Option<BlockSub>,
+    },
     /// Toolbar dropdowns.
     TurnInto,
-    OrderedNumber { block: BlockId, pos: Point<Pixels>, edit: bool, depth: usize },
+    OrderedNumber {
+        block: BlockId,
+        pos: Point<Pixels>,
+        edit: bool,
+        depth: usize,
+    },
     Align,
     Color,
     /// Link panel; `range` is empty when inserting a new link, `only_link`
     /// asks for the URL of a selection.
-    Link { block: BlockId, range: Range<usize>, only_link: bool },
+    Link {
+        block: BlockId,
+        range: Range<usize>,
+        only_link: bool,
+    },
     /// Toolbar 更多.
     TbMore,
-    Lang { block: BlockId, selected: usize },
-    CalloutColor { block: BlockId, section: usize },
+    Lang {
+        block: BlockId,
+        selected: usize,
+    },
+    CalloutColor {
+        block: BlockId,
+        section: usize,
+    },
     /// Emoji picker; `selected` is the highlighted search result.
-    Emoji { target: super::emoji_picker::EmojiTarget, selected: usize },
+    Emoji {
+        target: super::emoji_picker::EmojiTarget,
+        selected: usize,
+    },
     /// Table toolbar: 单元格背景颜色.
     CellBg,
     /// The LaTeX editor of the equation at `offset`.
-    Equation { block: BlockId, offset: usize },
+    Equation {
+        block: BlockId,
+        offset: usize,
+    },
     /// 编辑封面 and its 选择图片 panel (官方图库 / 本地上传).
     CoverEdit,
-    CoverPick { upload: bool },
+    CoverPick {
+        upload: bool,
+    },
     /// The info row's handle: 选择要展示的文档信息.
     /// 按钮设置 of the button at `offset`.
-    Button { block: BlockId, offset: usize },
+    Button {
+        block: BlockId,
+        offset: usize,
+    },
     /// The 日期提醒 at `offset`.
-    Reminder { block: BlockId, offset: usize },
+    Reminder {
+        block: BlockId,
+        offset: usize,
+    },
 }
 
 pub type BoundsMap = Rc<RefCell<HashMap<BlockId, Bounds<Pixels>>>>;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum ScrollIntent { RevealCaret, PreserveViewport }
+enum ScrollIntent {
+    RevealCaret,
+    PreserveViewport,
+}
 
 pub struct Editor {
     pub core: Core,
@@ -162,6 +201,41 @@ pub struct Editor {
     /// Painted bounds of the callout bar and its colour panel (last frame).
     pub callout_zone: Rc<RefCell<Vec<Bounds<Pixels>>>>,
     pub caret_visible: bool,
+    /// Current Vim mode (ignored while `settings::vim()` is off).
+    pub vim_mode: VimMode,
+    /// The `:` ex command line input; shown only while `vim_cmd_open`.
+    pub(super) vim_cmd: Entity<TextField>,
+    pub(super) vim_cmd_open: bool,
+    /// Live, uncommitted preview of a `:s`/`:%s` being typed in `vim_cmd` —
+    /// `None` outside the "typing the replacement" phase. Never touches the
+    /// undo stack (see `vim_sub_revert`); the real edit happens on Submit.
+    pub(super) vim_sub_preview: Option<VimSubPreview>,
+    /// Vim `r` was pressed: the next typed character replaces the one under the
+    /// caret (the key context drops `vim` for that keystroke so it reaches input).
+    pub(super) vim_replace_pending: bool,
+    /// Vim `m`/`` ` ``/`'` was pressed: the next letter names the mark to set
+    /// or jump to (same context-drop trick as `vim_replace_pending`).
+    pub(super) vim_mark_pending: Option<VimMarkOp>,
+    /// Named caret positions (`m{a-z}`), local to this document like nvim's
+    /// lowercase marks — resets naturally since `Editor` is per-document.
+    pub(super) vim_marks: HashMap<char, Pos>,
+    /// Pending operator (`d`/`c`/`y`) and the caret it was armed at; the next
+    /// motion defines the range it applies to.
+    pub(super) vim_pending_op: Option<(VimOp, Pos)>,
+    /// `i`/`a` pressed with an operator pending: `Some(around)` waits for the
+    /// text-object key (`w`, `"`, `(`, …).
+    pub(super) vim_textobj_pending: Option<bool>,
+    /// `/` or `?` was pressed: a bottom-docked prompt (reusing `find_field`
+    /// and the find engine) is open instead of the full find/replace popover.
+    pub(super) vim_search_bar: bool,
+    /// `self.find` was populated by a Vim command (`/` `?` `n` `N` `*` `#`),
+    /// not the real ⌘F — suppresses the popover for the rest of that search's
+    /// lifetime, even after `vim_search_bar` itself closes (`n`/`N` still
+    /// need `self.find` alive with no popover). Cleared by the real `open_find`.
+    pub(super) vim_search_quiet: bool,
+    /// `/` or `?`, whichever opened `vim_search_bar` (cosmetic only — both
+    /// search forward; see `vim_search_step`'s doc comment).
+    pub(super) vim_search_prefix: char,
     blink: Option<Task<()>>,
     pub goal_x: Option<Pixels>,
     /// The caret was placed on a wrap boundary from the row above: draw it at
@@ -266,6 +340,93 @@ pub struct Editor {
     _subs: Vec<Subscription>,
 }
 
+/// Vim mode. In Normal/Visual the caret is a block and letters are commands;
+/// in Insert text is typed as usual. `VisualLine` is charwise Visual's
+/// line-wise sibling, backed by the editor's whole-block selection.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum VimMode {
+    Normal,
+    Insert,
+    Visual,
+    VisualLine,
+    /// Columnar selection: the same byte-column range on each covered line.
+    VisualBlock,
+}
+
+/// A pending Vim operator (`d`/`c`/`y`) waiting for a motion to define its range.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum VimOp { Delete, Change, Yank }
+
+/// Which of `m`/`` ` ``/`'` armed `vim_mark_pending`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(super) enum VimMarkOp {
+    /// `m{a-z}`: record the caret under that name.
+    Set,
+    /// `` `{a-z} ``: jump to the exact recorded position.
+    JumpExact,
+    /// `'{a-z}`: jump to the start of the recorded position's line.
+    JumpLineStart,
+}
+
+/// How the most recent Vim yank should be pasted back. The system clipboard
+/// (used for the actual text, so yank/paste still cross documents) carries
+/// no such distinction, so it's tracked separately here — global, same
+/// lifetime as the clipboard itself, not per-document.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum VimYankKind { Char, Line, Block }
+
+static VIM_YANK_KIND: AtomicU8 = AtomicU8::new(0);
+
+fn set_vim_yank_kind(k: VimYankKind) {
+    VIM_YANK_KIND.store(k as u8, Ordering::Relaxed);
+}
+
+fn vim_yank_kind() -> VimYankKind {
+    match VIM_YANK_KIND.load(Ordering::Relaxed) {
+        1 => VimYankKind::Line,
+        2 => VimYankKind::Block,
+        _ => VimYankKind::Char,
+    }
+}
+
+/// A `:s`/`:%s` command as typed so far in `vim_cmd`, re-parsed on every
+/// keystroke. `/` is the only delimiter; see `vim_substitute`'s doc comment
+/// for the same limits that apply once the command is actually run.
+pub(super) enum VimSubLive {
+    /// No second `/` yet — still typing the pattern.
+    Pattern { whole_doc: bool, pat: String },
+    /// Second `/` seen — typing the replacement (`global` from any `g`
+    /// already typed in a, possibly still-growing, flags tail).
+    Replace { whole_doc: bool, pat: String, repl: String, global: bool },
+}
+
+/// `cmd` parses the same way whether it's complete (Submit) or partial
+/// (every keystroke) — only `Replace` is a valid final command.
+pub(super) fn parse_vim_substitute_live(cmd: &str) -> Option<VimSubLive> {
+    let whole_doc = cmd.starts_with('%');
+    let rest = cmd.strip_prefix('%').unwrap_or(cmd);
+    let rest = rest.strip_prefix("substitute").or_else(|| rest.strip_prefix('s'))?;
+    let rest = rest.strip_prefix('/')?;
+    Some(match rest.split_once('/') {
+        None => VimSubLive::Pattern { whole_doc, pat: rest.to_string() },
+        Some((pat, tail)) => {
+            let (repl, flags) = tail.split_once('/').unwrap_or((tail, ""));
+            VimSubLive::Replace { whole_doc, pat: pat.to_string(), repl: repl.to_string(), global: flags.contains('g') }
+        }
+    })
+}
+
+/// Pristine (pre-preview) text of each block a live `:s`/`:%s` touches, plus
+/// the pattern's match ranges in that text — frozen when the second `/` is
+/// typed, so only the replacement re-applies on later keystrokes.
+pub(super) struct VimSubPreview {
+    pub(super) whole_doc: bool,
+    pub(super) pat: String,
+    pub(super) originals: Vec<(BlockId, RichText, Vec<Range<usize>>)>,
+    /// `core.dirty` before the preview started; restored on revert.
+    pub(super) was_dirty: bool,
+}
+
 impl EventEmitter<EditorEvent> for Editor {}
 
 impl Focusable for Editor {
@@ -289,12 +450,19 @@ fn from16(s: &str, o16: usize) -> usize {
     s.len()
 }
 
+
 fn looks_like_url(q: &str) -> bool {
     q.contains("://") || q.starts_with("www.") || (q.contains('@') && q.contains('.'))
 }
 
 impl Editor {
-    pub fn new(doc: Document, modified: u64, page_width: PageWidth, window: &mut Window, cx: &mut Context<Self>) -> Self {
+    pub fn new(
+        doc: Document,
+        modified: u64,
+        page_width: PageWidth,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let link_field = cx.new(|cx| {
             let mut f = TextField::new("粘贴或输入链接", cx);
             f.tab_events = true;
@@ -312,6 +480,7 @@ impl Editor {
             f.line_height = 24.;
             f
         });
+        let vim_cmd = cx.new(|cx| TextField::new("", cx));
         let find_field = cx.new(|cx| TextField::new("在文档内查找", cx));
         let replace_field = cx.new(|cx| TextField::new("请输入文字", cx));
         let number_field = cx.new(|cx| TextField::new("编号", cx));
@@ -325,55 +494,119 @@ impl Editor {
             f
         });
         let mut subs = vec![
-            cx.subscribe_in(&number_field, window, |this, _, ev: &TextFieldEvent, window, cx| {
-                if !matches!(this.menu, Some(Menu::OrderedNumber { edit: true, .. })) { return }
-                match ev {
-                    TextFieldEvent::Submit => this.submit_ordered_number(window, cx),
-                    TextFieldEvent::Cancel => this.close_menu_focus(window, cx),
-                    _ => cx.notify(),
-                }
-            }),
-            cx.subscribe_in(&find_field, window, |this, _, ev: &TextFieldEvent, window, cx| this.on_find_event(ev, window, cx)),
-            cx.subscribe_in(&replace_field, window, |this, _, ev: &TextFieldEvent, window, cx| match ev {
-                TextFieldEvent::Cancel => this.close_find(window, cx),
-                _ => cx.notify(),
-            }),
-            cx.subscribe_in(&link_field, window, |this, _, ev: &TextFieldEvent, window, cx| this.on_link_field(ev, false, window, cx)),
-            cx.subscribe_in(&link_text_field, window, |this, _, ev: &TextFieldEvent, window, cx| this.on_link_field(ev, true, window, cx)),
-            cx.subscribe_in(&eq_field, window, |this, field, ev: &TextFieldEvent, window, cx| {
-                let Some(Menu::Equation { block, offset }) = this.menu.clone() else { return };
-                match ev {
-                    TextFieldEvent::Changed => {
-                        let src = field.read(cx).text.clone();
-                        this.core.set_equation_source(Pos::new(block, offset), &src);
-                        this.changed(window, cx);
-                    }
-                    TextFieldEvent::Cancel | TextFieldEvent::RightEdge => this.close_equation_editor(true, window, cx),
-                    TextFieldEvent::LeftEdge => this.close_equation_editor(false, window, cx),
-                    _ => {}
-                }
-            }),
-            cx.subscribe_in(&emoji_field, window, |this, _, ev: &TextFieldEvent, window, cx| this.on_emoji_field(ev, window, cx)),
-            cx.subscribe_in(&lang_field, window, |this, _, ev: &TextFieldEvent, window, cx| {
-                let Some(Menu::Lang { block, selected }) = this.menu.clone() else { return };
-                let n = menus::filter_languages(&this.lang_field.read(cx).text).len();
-                match ev {
-                    TextFieldEvent::Changed => this.menu = Some(Menu::Lang { block, selected: 0 }),
-                    TextFieldEvent::Up if n > 0 => {
-                        this.menu = Some(Menu::Lang { block, selected: (selected + n - 1) % n })
-                    }
-                    TextFieldEvent::Down if n > 0 => this.menu = Some(Menu::Lang { block, selected: (selected + 1) % n }),
-                    TextFieldEvent::Submit => {
-                        if let Some(l) = menus::filter_languages(&this.lang_field.read(cx).text).get(selected) {
-                            this.set_lang(block, l, window, cx);
-                        }
+            cx.subscribe_in(
+                &number_field,
+                window,
+                |this, _, ev: &TextFieldEvent, window, cx| {
+                    if !matches!(this.menu, Some(Menu::OrderedNumber { edit: true, .. })) {
                         return;
                     }
-                    TextFieldEvent::Cancel => return this.close_menu_focus(window, cx),
+                    match ev {
+                        TextFieldEvent::Submit => this.submit_ordered_number(window, cx),
+                        TextFieldEvent::Cancel => this.close_menu_focus(window, cx),
+                        _ => cx.notify(),
+                    }
+                },
+            ),
+            cx.subscribe_in(
+                &vim_cmd,
+                window,
+                |this, _, ev: &TextFieldEvent, window, cx| match ev {
+                    TextFieldEvent::Submit => this.run_vim_command(window, cx),
+                    TextFieldEvent::Cancel => this.close_vim_command(window, cx),
+                    TextFieldEvent::Changed => this.on_vim_cmd_changed(cx),
                     _ => {}
-                }
-                cx.notify();
-            }),
+                },
+            ),
+            cx.subscribe_in(
+                &find_field,
+                window,
+                |this, _, ev: &TextFieldEvent, window, cx| this.on_find_event(ev, window, cx),
+            ),
+            cx.subscribe_in(
+                &replace_field,
+                window,
+                |this, _, ev: &TextFieldEvent, window, cx| match ev {
+                    TextFieldEvent::Cancel => this.close_find(window, cx),
+                    _ => cx.notify(),
+                },
+            ),
+            cx.subscribe_in(
+                &link_field,
+                window,
+                |this, _, ev: &TextFieldEvent, window, cx| {
+                    this.on_link_field(ev, false, window, cx)
+                },
+            ),
+            cx.subscribe_in(
+                &link_text_field,
+                window,
+                |this, _, ev: &TextFieldEvent, window, cx| this.on_link_field(ev, true, window, cx),
+            ),
+            cx.subscribe_in(
+                &eq_field,
+                window,
+                |this, field, ev: &TextFieldEvent, window, cx| {
+                    let Some(Menu::Equation { block, offset }) = this.menu.clone() else {
+                        return;
+                    };
+                    match ev {
+                        TextFieldEvent::Changed => {
+                            let src = field.read(cx).text.clone();
+                            this.core.set_equation_source(Pos::new(block, offset), &src);
+                            this.changed(window, cx);
+                        }
+                        TextFieldEvent::Cancel | TextFieldEvent::RightEdge => {
+                            this.close_equation_editor(true, window, cx)
+                        }
+                        TextFieldEvent::LeftEdge => this.close_equation_editor(false, window, cx),
+                        _ => {}
+                    }
+                },
+            ),
+            cx.subscribe_in(
+                &emoji_field,
+                window,
+                |this, _, ev: &TextFieldEvent, window, cx| this.on_emoji_field(ev, window, cx),
+            ),
+            cx.subscribe_in(
+                &lang_field,
+                window,
+                |this, _, ev: &TextFieldEvent, window, cx| {
+                    let Some(Menu::Lang { block, selected }) = this.menu.clone() else {
+                        return;
+                    };
+                    let n = menus::filter_languages(&this.lang_field.read(cx).text).len();
+                    match ev {
+                        TextFieldEvent::Changed => {
+                            this.menu = Some(Menu::Lang { block, selected: 0 })
+                        }
+                        TextFieldEvent::Up if n > 0 => {
+                            this.menu = Some(Menu::Lang {
+                                block,
+                                selected: (selected + n - 1) % n,
+                            })
+                        }
+                        TextFieldEvent::Down if n > 0 => {
+                            this.menu = Some(Menu::Lang {
+                                block,
+                                selected: (selected + 1) % n,
+                            })
+                        }
+                        TextFieldEvent::Submit => {
+                            if let Some(l) = menus::filter_languages(&this.lang_field.read(cx).text)
+                                .get(selected)
+                            {
+                                this.set_lang(block, l, window, cx);
+                            }
+                            return;
+                        }
+                        TextFieldEvent::Cancel => return this.close_menu_focus(window, cx),
+                        _ => {}
+                    }
+                    cx.notify();
+                },
+            ),
         ];
         let (cd, cd_subs) = super::countdown::CdUi::new(window, cx);
         subs.extend(cd_subs);
@@ -412,6 +645,18 @@ impl Editor {
             handle_targets: vec![],
             callout_zone: Rc::default(),
             caret_visible: true,
+            vim_mode: VimMode::Normal,
+            vim_cmd,
+            vim_cmd_open: false,
+            vim_sub_preview: None,
+            vim_replace_pending: false,
+            vim_mark_pending: None,
+            vim_marks: HashMap::new(),
+            vim_search_bar: false,
+            vim_search_quiet: false,
+            vim_search_prefix: '/',
+            vim_pending_op: None,
+            vim_textobj_pending: None,
             blink: None,
             goal_x: None,
             caret_row_end: None,
@@ -494,7 +739,8 @@ impl Editor {
     /// very top, so a document that was never scrolled keeps no entry.
     pub fn scroll_top(&self) -> Option<(usize, f32)> {
         let top = self.list.logical_scroll_top();
-        (top.item_ix > 0 || top.offset_in_item > px(0.)).then(|| (top.item_ix, f32::from(top.offset_in_item)))
+        (top.item_ix > 0 || top.offset_in_item > px(0.))
+            .then(|| (top.item_ix, f32::from(top.offset_in_item)))
     }
 
     pub fn restart_blink(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -506,7 +752,9 @@ impl Editor {
         }
         self.blink = Some(cx.spawn_in(window, async move |this, cx| {
             loop {
-                cx.background_executor().timer(Duration::from_millis(500)).await;
+                cx.background_executor()
+                    .timer(Duration::from_millis(500))
+                    .await;
                 let ok = this.update_in(cx, |e, window, cx| {
                     if e.focus.is_focused(window) {
                         e.caret_visible = !e.caret_visible;
@@ -547,13 +795,24 @@ impl Editor {
     }
 
     /// Pointer edits to an independent target must not scroll to an old caret.
-    pub(super) fn changed_preserving_viewport(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub(super) fn changed_preserving_viewport(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         self.changed_with_scroll(ScrollIntent::PreserveViewport, window, cx);
     }
 
-    fn changed_with_scroll(&mut self, intent: ScrollIntent, window: &mut Window, cx: &mut Context<Self>) {
+    fn changed_with_scroll(
+        &mut self,
+        intent: ScrollIntent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let reveal = intent == ScrollIntent::RevealCaret;
-        if reveal { self.core.reveal_caret(); }
+        if reveal {
+            self.core.reveal_caret();
+        }
         if self.core.dirty {
             // The rows move under the caret: an old row end no longer applies.
             self.caret_row_end = None;
@@ -607,7 +866,10 @@ impl Editor {
             }
             p
         };
-        self.core.sel = Selection { anchor: clamp(sel.anchor), head: clamp(sel.head) };
+        self.core.sel = Selection {
+            anchor: clamp(sel.anchor),
+            head: clamp(sel.head),
+        };
         self.core.dirty = false;
         self.keep_read_only_title();
         cx.emit(EditorEvent::Changed);
@@ -651,14 +913,20 @@ impl Editor {
     fn sync_slash(&mut self) {
         let Some(s) = self.slash.clone() else { return };
         let sel = self.core.sel;
-        let text = self.core.text_of(s.block).map(|t| t.text.clone()).unwrap_or_default();
+        let text = self
+            .core
+            .text_of(s.block)
+            .map(|t| t.text.clone())
+            .unwrap_or_default();
         let close = !sel.is_collapsed()
             || self.core.in_block_mode()
             || sel.head.block != s.block
             || sel.head.offset < s.start
             || sel.head.offset > text.len()
             || !matches!(text.get(s.trigger..s.start), Some("/") | Some("、"))
-            || text.get(s.start..sel.head.offset).is_none_or(|q| q.ends_with("  ") || looks_like_url(q));
+            || text
+                .get(s.start..sel.head.offset)
+                .is_none_or(|q| q.ends_with("  ") || looks_like_url(q));
         if close {
             self.slash = None;
             return;
@@ -670,9 +938,17 @@ impl Editor {
     }
 
     pub fn slash_query(&self) -> String {
-        let Some(s) = &self.slash else { return String::new() };
-        let text = self.core.text_of(s.block).map(|t| t.text.as_str()).unwrap_or("");
-        text.get(s.start..self.core.sel.head.offset).unwrap_or("").to_string()
+        let Some(s) = &self.slash else {
+            return String::new();
+        };
+        let text = self
+            .core
+            .text_of(s.block)
+            .map(|t| t.text.as_str())
+            .unwrap_or("");
+        text.get(s.start..self.core.sel.head.offset)
+            .unwrap_or("")
+            .to_string()
     }
 
     /// Matching items in display order: grouped under their group title,
@@ -684,9 +960,14 @@ impl Editor {
             (0..menus::SLASH_ITEMS.len()).collect()
         };
         let (grid, with_text) = (self.slash_grid(), self.slash_grid_text());
-        let ranked: Vec<usize> =
-            ranked.into_iter().filter(|i| menus::SLASH_ITEMS[*i].group != 0 || menus::basic_visible(menus::SLASH_ITEMS[*i].kind, grid, with_text))
-                .filter(|i| !self.markdown || menus::markdown_ok(menus::SLASH_ITEMS[*i].kind)).collect();
+        let ranked: Vec<usize> = ranked
+            .into_iter()
+            .filter(|i| {
+                menus::SLASH_ITEMS[*i].group != 0
+                    || menus::basic_visible(menus::SLASH_ITEMS[*i].kind, grid, with_text)
+            })
+            .filter(|i| !self.markdown || menus::markdown_ok(menus::SLASH_ITEMS[*i].kind))
+            .collect();
         let mut groups: Vec<usize> = vec![];
         for i in &ranked {
             let g = menus::SLASH_ITEMS[*i].group;
@@ -696,7 +977,12 @@ impl Editor {
         }
         groups
             .iter()
-            .flat_map(|g| ranked.iter().copied().filter(move |i| menus::SLASH_ITEMS[*i].group == *g))
+            .flat_map(|g| {
+                ranked
+                    .iter()
+                    .copied()
+                    .filter(move |i| menus::SLASH_ITEMS[*i].group == *g)
+            })
             .collect()
     }
 
@@ -705,7 +991,14 @@ impl Editor {
     pub fn slash_grid(&self) -> bool {
         match &self.slash {
             Some(_) => self.slash_query().is_empty(),
-            None => matches!(self.menu, Some(Menu::Add { .. }) | Some(Menu::Block { sub: Some(BlockSub::Add(_)), .. })),
+            None => matches!(
+                self.menu,
+                Some(Menu::Add { .. })
+                    | Some(Menu::Block {
+                        sub: Some(BlockSub::Add(_)),
+                        ..
+                    })
+            ),
         }
     }
 
@@ -713,7 +1006,10 @@ impl Editor {
     /// already is one.
     pub fn slash_grid_text(&self) -> bool {
         match &self.slash {
-            Some(s) => self.core.text_of(s.block).is_some_and(|t| t.text.len() > s.start - s.trigger),
+            Some(s) => self
+                .core
+                .text_of(s.block)
+                .is_some_and(|t| t.text.len() > s.start - s.trigger),
             None => matches!(self.menu, Some(Menu::Block { .. })),
         }
     }
@@ -730,7 +1026,12 @@ impl Editor {
         let text = &self.core.text_of(h.block).unwrap().text;
         let before = &text[..trigger];
         if before.is_empty() || before.ends_with(char::is_whitespace) {
-            self.slash = Some(Slash { block: h.block, trigger, start: h.offset, selected: 0 });
+            self.slash = Some(Slash {
+                block: h.block,
+                trigger,
+                start: h.offset,
+                selected: 0,
+            });
             self.slash_scroll.set_offset(Point::default());
         }
     }
@@ -739,7 +1040,9 @@ impl Editor {
     fn list_menu_key(&mut self, key: ListKey, window: &mut Window, cx: &mut Context<Self>) -> bool {
         if self.mention.is_some() {
             return match key {
-                ListKey::Up | ListKey::Down => self.mention_key(Some(matches!(key, ListKey::Up)), false, false, window, cx),
+                ListKey::Up | ListKey::Down => {
+                    self.mention_key(Some(matches!(key, ListKey::Up)), false, false, window, cx)
+                }
                 ListKey::Enter => self.mention_key(None, true, false, window, cx),
                 ListKey::Close | ListKey::Left | ListKey::Right => false,
                 ListKey::CloseAndPass => {
@@ -783,30 +1086,70 @@ impl Editor {
                     child += 1;
                 }
             }
-            if grid && results.get(v).is_some_and(|i| menus::SLASH_ITEMS[*i].group > 0) {
+            if grid
+                && results
+                    .get(v)
+                    .is_some_and(|i| menus::SLASH_ITEMS[*i].group > 0)
+            {
                 child += 1;
             }
             e.slash_scroll.scroll_to_item(child);
         };
         // The icon grid (rows of GRID_COLS, then the list): ← / → step through
         // items in order, ↑ / ↓ move a whole row inside the grid (issue #4).
-        let cells = if grid { results.iter().take_while(|i| menus::SLASH_ITEMS[**i].group == 0).count() } else { 0 };
-        let (prev, next) = (if cur >= n { n.saturating_sub(1) } else { (cur + n - 1) % n.max(1) }, if cur >= n { 0 } else { (cur + 1) % n.max(1) });
+        let cells = if grid {
+            results
+                .iter()
+                .take_while(|i| menus::SLASH_ITEMS[**i].group == 0)
+                .count()
+        } else {
+            0
+        };
+        let (prev, next) = (
+            if cur >= n {
+                n.saturating_sub(1)
+            } else {
+                (cur + n - 1) % n.max(1)
+            },
+            if cur >= n { 0 } else { (cur + 1) % n.max(1) },
+        );
         let key = match key {
             ListKey::Left | ListKey::Right if !grid => ListKey::Close,
             k => k,
         };
         match key {
-            _ if n == 0 && matches!(key, ListKey::Up | ListKey::Down | ListKey::Left | ListKey::Right) => {}
+            _ if n == 0
+                && matches!(
+                    key,
+                    ListKey::Up | ListKey::Down | ListKey::Left | ListKey::Right
+                ) => {}
             ListKey::Left => set(self, prev),
             ListKey::Right => set(self, next),
             // Up: a row up in the grid; from the list's first item, back to the
             // grid's last row; from the grid's top row, around to the last item.
-            ListKey::Up if cur < cells => set(self, if cur >= menus::GRID_COLS { cur - menus::GRID_COLS } else { n - 1 }),
-            ListKey::Up if cur == cells && cells > 0 => set(self, (cells - 1) / menus::GRID_COLS * menus::GRID_COLS),
+            ListKey::Up if cur < cells => set(
+                self,
+                if cur >= menus::GRID_COLS {
+                    cur - menus::GRID_COLS
+                } else {
+                    n - 1
+                },
+            ),
+            ListKey::Up if cur == cells && cells > 0 => {
+                set(self, (cells - 1) / menus::GRID_COLS * menus::GRID_COLS)
+            }
             ListKey::Up => set(self, prev),
             // Down: a row down in the grid; from its last row, into the list.
-            ListKey::Down if cur < cells => set(self, if cur + menus::GRID_COLS < cells { cur + menus::GRID_COLS } else if cells < n { cells } else { 0 }),
+            ListKey::Down if cur < cells => set(
+                self,
+                if cur + menus::GRID_COLS < cells {
+                    cur + menus::GRID_COLS
+                } else if cells < n {
+                    cells
+                } else {
+                    0
+                },
+            ),
             ListKey::Down => set(self, next),
             ListKey::Enter => match results.get(cur) {
                 Some(i) => {
@@ -843,7 +1186,9 @@ impl Editor {
         // random one).
         let s = super::emoji::callout_setting();
         let mut k = menus::callout(s.emoji.as_deref());
-        if let BlockKind::Callout { bg: b, border: bo, .. } = &mut k
+        if let BlockKind::Callout {
+            bg: b, border: bo, ..
+        } = &mut k
             && (s.bg.is_some() || s.border.is_some())
         {
             *b = s.bg.map(ColorName);
@@ -858,12 +1203,23 @@ impl Editor {
     }
 
     /// `size` is the (rows, cols) picked in the "+" panel's size picker.
-    pub fn run_slash_sized(&mut self, kind: SlashKind, size: Option<(usize, usize)>, window: &mut Window, cx: &mut Context<Self>) {
+    pub fn run_slash_sized(
+        &mut self,
+        kind: SlashKind,
+        size: Option<(usize, usize)>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         self.run_slash_with(kind, size, crate::model::ButtonAction::OpenLink, window, cx)
     }
 
     /// 按钮's type submenu.
-    pub(super) fn run_slash_button(&mut self, action: crate::model::ButtonAction, window: &mut Window, cx: &mut Context<Self>) {
+    pub(super) fn run_slash_button(
+        &mut self,
+        action: crate::model::ButtonAction,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         self.run_slash_with(SlashKind::Button, None, action, window, cx)
     }
 
@@ -877,17 +1233,27 @@ impl Editor {
     ) {
         if let Some(s) = self.slash.take() {
             let end = self.core.sel.head.offset.max(s.start);
-            self.core.sel = Selection { anchor: Pos::new(s.block, s.trigger), head: Pos::new(s.block, end) };
+            self.core.sel = Selection {
+                anchor: Pos::new(s.block, s.trigger),
+                head: Pos::new(s.block, end),
+            };
             self.core.delete_selection();
         }
         // 在下方添加 runs the item on a fresh line under the block.
-        if let Some(Menu::Block { block, sub: Some(BlockSub::Add(_)) }) = self.menu {
+        if let Some(Menu::Block {
+            block,
+            sub: Some(BlockSub::Add(_)),
+        }) = self.menu
+        {
             self.core.clear_block_sel();
             let b = Block::text("");
             let id = b.id;
             self.core.checkpoint(core::EditKind::Other);
             self.core.insert_after(block, b);
-            self.menu = Some(Menu::Add { block: id, selected: 0 });
+            self.menu = Some(Menu::Add {
+                block: id,
+                selected: 0,
+            });
         }
         if let Some(Menu::Add { block, .. }) = self.menu {
             self.core.clear_block_sel();
@@ -896,10 +1262,9 @@ impl Editor {
         self.menu = None;
         self.hover = None;
         let id = self.core.sel.head.block;
-        let empty = self
-            .core
-            .block(id)
-            .is_some_and(|b| matches!(b.kind, BlockKind::Text) && b.text.is_empty() && b.children.is_empty());
+        let empty = self.core.block(id).is_some_and(|b| {
+            matches!(b.kind, BlockKind::Text) && b.text.is_empty() && b.children.is_empty()
+        });
         let turn = match kind {
             SlashKind::Text => Some(BlockKind::Text),
             SlashKind::Heading(l) => Some(menus::heading(l)),
@@ -943,7 +1308,10 @@ impl Editor {
                 self.core.sel = Selection::caret(Pos::new(p, 0));
             }
             SlashKind::Countdown => {
-                let nid = self.core.insert_block(Block::new(BlockKind::Countdown(Default::default()), RichText::default()));
+                let nid = self.core.insert_block(Block::new(
+                    BlockKind::Countdown(Default::default()),
+                    RichText::default(),
+                ));
                 let p = self.core.ensure_paragraph_after(nid);
                 self.core.sel = Selection::caret(Pos::new(p, 0));
                 self.changed(window, cx);
@@ -956,7 +1324,15 @@ impl Editor {
             SlashKind::Grid => {
                 let n = size.map_or(2, |s| s.1);
                 let cols: Vec<Block> = (0..n)
-                    .map(|_| Block::new(BlockKind::Column { ratio: 1. / n as f32 }, RichText::default()).with_children(vec![Block::text("")]))
+                    .map(|_| {
+                        Block::new(
+                            BlockKind::Column {
+                                ratio: 1. / n as f32,
+                            },
+                            RichText::default(),
+                        )
+                        .with_children(vec![Block::text("")])
+                    })
                     .collect();
                 let first = cols[0].children[0].id;
                 let g = Block::new(BlockKind::Grid, RichText::default()).with_children(cols);
@@ -980,10 +1356,14 @@ impl Editor {
             col_widths: vec![100.; cols],
             header_rows: 0,
             header_col: false,
-            rows: (0..rows).map(|_| (0..cols).map(|_| TableCell::empty()).collect()).collect(),
+            rows: (0..rows)
+                .map(|_| (0..cols).map(|_| TableCell::empty()).collect())
+                .collect(),
         };
         let first = t.rows[0][0].blocks[0].id;
-        let nid = self.core.insert_block(Block::new(BlockKind::Table(t), RichText::default()));
+        let nid = self
+            .core
+            .insert_block(Block::new(BlockKind::Table(t), RichText::default()));
         self.core.ensure_paragraph_after(nid);
         self.core.sel = Selection::caret(Pos::new(first, 0));
     }
@@ -1001,7 +1381,11 @@ impl Editor {
                 && let Some(p) = paths.into_iter().next()
             {
                 let _ = this.update_in(cx, |e, window, cx| {
-                    let ext = p.extension().and_then(|s| s.to_str()).unwrap_or("png").to_string();
+                    let ext = p
+                        .extension()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or("png")
+                        .to_string();
                     if let Ok(bytes) = std::fs::read(&p) {
                         e.insert_image_bytes(&bytes, &ext, window, cx);
                     }
@@ -1011,7 +1395,13 @@ impl Editor {
         .detach();
     }
 
-    fn insert_image_bytes(&mut self, bytes: &[u8], ext: &str, window: &mut Window, cx: &mut Context<Self>) {
+    fn insert_image_bytes(
+        &mut self,
+        bytes: &[u8],
+        ext: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let b = match super::image::image_block_from(bytes, ext) {
             Ok(b) => b,
             Err(msg) => return self.toast(msg, cx),
@@ -1026,16 +1416,24 @@ impl Editor {
 
     /// Open the LaTeX editor of the equation at `p` (its source selected).
     pub fn open_equation_editor(&mut self, p: Pos, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(src) = self.core.equation_source(p) else { return };
+        let Some(src) = self.core.equation_source(p) else {
+            return;
+        };
         self.eq_field.update(cx, |f, cx| {
             f.set_text(&src, cx);
             f.select_all_text(cx);
         });
         self.core.clear_block_sel();
         self.core.break_coalescing();
-        self.core.sel = Selection { anchor: p, head: Pos::new(p.block, p.offset + core::EQUATION.len()) };
+        self.core.sel = Selection {
+            anchor: p,
+            head: Pos::new(p.block, p.offset + core::EQUATION.len()),
+        };
         self.dragging = false;
-        self.menu = Some(Menu::Equation { block: p.block, offset: p.offset });
+        self.menu = Some(Menu::Equation {
+            block: p.block,
+            offset: p.offset,
+        });
         let fh = self.eq_field.read(cx).focus_handle(cx);
         window.focus(&fh);
         cx.notify();
@@ -1043,23 +1441,42 @@ impl Editor {
 
     /// Leave the equation editor with the caret after (or before) it.
     fn close_equation_editor(&mut self, after: bool, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(Menu::Equation { block, offset }) = self.menu.take() else { return };
+        let Some(Menu::Equation { block, offset }) = self.menu.take() else {
+            return;
+        };
         self.core.break_coalescing();
-        let o = if after { offset + core::EQUATION.len() } else { offset };
+        let o = if after {
+            offset + core::EQUATION.len()
+        } else {
+            offset
+        };
         self.core.sel = Selection::caret(Pos::new(block, o));
         window.focus(&self.focus);
         self.restart_blink(window, cx);
         cx.notify();
     }
 
-    fn on_link_field(&mut self, ev: &TextFieldEvent, text: bool, window: &mut Window, cx: &mut Context<Self>) {
+    fn on_link_field(
+        &mut self,
+        ev: &TextFieldEvent,
+        text: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         match ev {
             TextFieldEvent::Submit => self.submit_link(window, cx),
             TextFieldEvent::Cancel => self.close_link_panel(window, cx),
             // Basic mode: Tab / Shift+Tab move between 文本 and 链接.
             TextFieldEvent::Tab | TextFieldEvent::ShiftTab => {
-                if let Some(Menu::Link { only_link: false, .. }) = self.menu {
-                    let f = if text { &self.link_field } else { &self.link_text_field };
+                if let Some(Menu::Link {
+                    only_link: false, ..
+                }) = self.menu
+                {
+                    let f = if text {
+                        &self.link_field
+                    } else {
+                        &self.link_text_field
+                    };
                     let fh = f.read(cx).focus_handle(cx);
                     f.update(cx, |f, cx| f.select_all_text(cx));
                     window.focus(&fh);
@@ -1070,7 +1487,13 @@ impl Editor {
         }
     }
 
-    pub fn set_lang(&mut self, block: BlockId, lang: &str, window: &mut Window, cx: &mut Context<Self>) {
+    pub fn set_lang(
+        &mut self,
+        block: BlockId,
+        lang: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         self.core.checkpoint(core::EditKind::Other);
         if let Some(b) = self.core.block_mut(block)
             && let BlockKind::Code { lang: l, .. } = &mut b.kind
@@ -1091,8 +1514,16 @@ impl Editor {
     }
 
     /// Text color / background from the color panel (None = default).
-    pub fn apply_color(&mut self, text: Option<Option<ColorName>>, bg: Option<Option<ColorName>>, window: &mut Window, cx: &mut Context<Self>) {
-        if self.markdown { return; }
+    pub fn apply_color(
+        &mut self,
+        text: Option<Option<ColorName>>,
+        bg: Option<Option<ColorName>>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.markdown {
+            return;
+        }
         if let Some(t) = &text {
             self.last_color.0 = t.clone();
         }
@@ -1116,7 +1547,13 @@ impl Editor {
     }
 
     /// Handle menu 颜色 → 背景颜色: fills the selected blocks (or `block`).
-    pub fn set_block_bg(&mut self, block: BlockId, bg: Option<ColorName>, window: &mut Window, cx: &mut Context<Self>) {
+    pub fn set_block_bg(
+        &mut self,
+        block: BlockId,
+        bg: Option<ColorName>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let mut ids = self.core.block_sel_ids();
         if !ids.contains(&block) {
             ids = vec![block];
@@ -1148,7 +1585,11 @@ impl Editor {
         let m = self
             .core
             .text_of(p.block)
-            .and_then(|t| t.spans().find(|(r, _)| r.start <= p.offset && p.offset < r.end).map(|(_, m)| m.clone()))
+            .and_then(|t| {
+                t.spans()
+                    .find(|(r, _)| r.start <= p.offset && p.offset < r.end)
+                    .map(|(_, m)| m.clone())
+            })
             .unwrap_or_default();
         (m.text_color, m.bg_color)
     }
@@ -1156,19 +1597,33 @@ impl Editor {
     pub fn set_callout(
         &mut self,
         block: BlockId,
-        f: impl FnOnce(&mut Option<ColorName>, &mut Option<ColorName>, &mut Option<ColorName>, &mut String),
+        f: impl FnOnce(
+            &mut Option<ColorName>,
+            &mut Option<ColorName>,
+            &mut Option<ColorName>,
+            &mut String,
+        ),
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         self.core.checkpoint(core::EditKind::Other);
         if let Some(b) = self.core.block_mut(block)
-            && let BlockKind::Callout { emoji, bg, border, text_color } = &mut b.kind
+            && let BlockKind::Callout {
+                emoji,
+                bg,
+                border,
+                text_color,
+            } = &mut b.kind
         {
             let old = emoji.clone();
             f(bg, border, text_color, emoji);
             let name = |c: &Option<ColorName>| c.as_ref().map(|c| c.0.clone());
             let picked = (*emoji != old).then(|| emoji.clone());
-            super::emoji::save_callout(name(bg).as_deref(), name(border).as_deref(), picked.as_deref());
+            super::emoji::save_callout(
+                name(bg).as_deref(),
+                name(border).as_deref(),
+                picked.as_deref(),
+            );
         }
         self.changed_preserving_viewport(window, cx);
     }
@@ -1182,9 +1637,14 @@ impl Editor {
             Mark::Code => (|m| m.code, |m, v| m.code = v),
         };
         if let Some(ids) = self.whole_blocks() {
-            let all = ids.iter().all(|id| self.core.text_of(*id).is_none_or(|t| t.all_marks(0..t.len(), get)));
+            let all = ids.iter().all(|id| {
+                self.core
+                    .text_of(*id)
+                    .is_none_or(|t| t.all_marks(0..t.len(), get))
+            });
             if all {
-                self.core.apply_marks_to_blocks(&ids, move |m| set(m, false));
+                self.core
+                    .apply_marks_to_blocks(&ids, move |m| set(m, false));
             } else {
                 self.core.apply_marks_to_blocks(&ids, move |m| set(m, true));
             }
@@ -1200,7 +1660,9 @@ impl Editor {
         let whole: Option<HashSet<BlockId>> = self.whole_blocks().map(|v| v.into_iter().collect());
         let mut any = false;
         for u in us.iter().filter(|u| u.text && u.id != TITLE) {
-            let Some(t) = self.core.text_of(u.id) else { continue };
+            let Some(t) = self.core.text_of(u.id) else {
+                continue;
+            };
             let r = if let Some(whole) = &whole {
                 if !whole.contains(&u.id) {
                     continue;
@@ -1220,7 +1682,13 @@ impl Editor {
         any
     }
 
-    pub fn turn(&mut self, kind: BlockKind, toggle: bool, window: &mut Window, cx: &mut Context<Self>) {
+    pub fn turn(
+        &mut self,
+        kind: BlockKind,
+        toggle: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let ids = self.core.selected_blocks();
         let kind = match kind {
             BlockKind::Code { .. } => menus::code_block(&self.last_lang),
@@ -1238,7 +1706,8 @@ impl Editor {
     pub fn align(&mut self, a: Align, window: &mut Window, cx: &mut Context<Self>) {
         // A Markdown file keeps alignment only as a table column's.
         if self.markdown {
-            if self.core.cell_sel.is_some() || self.core.cell_of(self.core.sel.head.block).is_some() {
+            if self.core.cell_sel.is_some() || self.core.cell_of(self.core.sel.head.block).is_some()
+            {
                 self.core.table_align_columns(a);
                 self.changed(window, cx);
             }
@@ -1250,7 +1719,12 @@ impl Editor {
     }
 
     pub fn current_align(&self) -> Align {
-        self.core.selected_blocks().first().and_then(|id| self.core.block(*id)).map(|b| b.align).unwrap_or_default()
+        self.core
+            .selected_blocks()
+            .first()
+            .and_then(|id| self.core.block(*id))
+            .map(|b| b.align)
+            .unwrap_or_default()
     }
 
     // ---- caret movement
@@ -1264,13 +1738,23 @@ impl Editor {
         }
         let h = s.head;
         let us = self.core.units();
-        let Some(i) = us.iter().position(|u| u.id == h.block) else { return };
+        let Some(i) = us.iter().position(|u| u.id == h.block) else {
+            return;
+        };
         if us[i].text {
-            let text = self.core.text_of(h.block).map(|t| t.text.clone()).unwrap_or_default();
+            let text = self
+                .core
+                .text_of(h.block)
+                .map(|t| t.text.clone())
+                .unwrap_or_default();
             // A wrap boundary is two caret stops: the end of the row above and
             // the start of the row below, at the same offset.
             let at_row_end = self.caret_row_end == Some((h.block, h.offset));
-            let starts_row = self.cache.borrow().get(&h.block).is_some_and(|l| l.starts_row(h.offset));
+            let starts_row = self
+                .cache
+                .borrow()
+                .get(&h.block)
+                .is_some_and(|l| l.starts_row(h.offset));
             if !word && right && at_row_end {
                 return self.set_caret(Pos::new(h.block, h.offset), extend);
             }
@@ -1280,11 +1764,19 @@ impl Editor {
                 return;
             }
             if right && h.offset < text.len() {
-                let o = if word { core::next_word(&text, h.offset) } else { core::next_grapheme(&text, h.offset) };
+                let o = if word {
+                    core::next_word(&text, h.offset)
+                } else {
+                    core::next_grapheme(&text, h.offset)
+                };
                 return self.set_caret(Pos::new(h.block, o), extend);
             }
             if !right && h.offset > 0 {
-                let o = if word { core::prev_word(&text, h.offset) } else { core::prev_grapheme(&text, h.offset) };
+                let o = if word {
+                    core::prev_word(&text, h.offset)
+                } else {
+                    core::prev_grapheme(&text, h.offset)
+                };
                 return self.set_caret(Pos::new(h.block, o), extend);
             }
         }
@@ -1302,14 +1794,20 @@ impl Editor {
     fn move_v(&mut self, down: bool, extend: bool) {
         let h = self.core.sel.head;
         let us = self.core.units();
-        let Some(i) = us.iter().position(|u| u.id == h.block) else { return };
+        let Some(i) = us.iter().position(|u| u.id == h.block) else {
+            return;
+        };
         let cache = self.cache.clone();
         let cache = cache.borrow();
         let goal = self
             .goal_x
             .or_else(|| {
                 cache.get(&h.block).map(|l| {
-                    if self.caret_row_end == Some((h.block, h.offset)) { l.position_at_row_end(h.offset).x } else { l.position_for(h.offset).x }
+                    if self.caret_row_end == Some((h.block, h.offset)) {
+                        l.position_at_row_end(h.offset).x
+                    } else {
+                        l.position_for(h.offset).x
+                    }
                 })
             })
             .unwrap_or_default();
@@ -1317,8 +1815,13 @@ impl Editor {
             && let Some(l) = cache.get(&h.block)
             && !l.rows.is_empty()
         {
-            let ri = l.row_index_for_caret(h.offset, self.caret_row_end == Some((h.block, h.offset)));
-            let target = if down { (ri + 1 < l.rows.len()).then_some(ri + 1) } else { ri.checked_sub(1) };
+            let ri =
+                l.row_index_for_caret(h.offset, self.caret_row_end == Some((h.block, h.offset)));
+            let target = if down {
+                (ri + 1 < l.rows.len()).then_some(ri + 1)
+            } else {
+                ri.checked_sub(1)
+            };
             if let Some(t) = target {
                 let (o, at_row_end) = l.caret_in_row(t, goal);
                 drop(cache);
@@ -1341,7 +1844,11 @@ impl Editor {
             }
             return;
         }
-        let next = if down { us.get(i + 1) } else { i.checked_sub(1).map(|k| &us[k]) };
+        let next = if down {
+            us.get(i + 1)
+        } else {
+            i.checked_sub(1).map(|k| &us[k])
+        };
         let p = match next {
             Some(u) if u.text => {
                 let o = cache
@@ -1373,11 +1880,18 @@ impl Editor {
             let cache = self.cache.borrow();
             match cache.get(&h.block) {
                 Some(l) if !l.rows.is_empty() => {
-                    let ri = l.row_index_for_caret(h.offset, self.caret_row_end == Some((h.block, h.offset)));
+                    let ri = l.row_index_for_caret(
+                        h.offset,
+                        self.caret_row_end == Some((h.block, h.offset)),
+                    );
                     let r = &l.rows[ri];
                     // The end of a wrapped row is a caret stop of its own: the
                     // caret stays on this row instead of the next one's start.
-                    if end { (r.range.end, l.row_wraps(ri)) } else { (r.range.start, false) }
+                    if end {
+                        (r.range.end, l.row_wraps(ri))
+                    } else {
+                        (r.range.start, false)
+                    }
                 }
                 _ => {
                     if end {
@@ -1514,7 +2028,12 @@ impl Editor {
         self.changed(window, cx);
     }
 
-    fn on_select_word_left(&mut self, _: &k::SelectWordLeft, window: &mut Window, cx: &mut Context<Self>) {
+    fn on_select_word_left(
+        &mut self,
+        _: &k::SelectWordLeft,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if !self.guard(window, cx) || self.core.in_block_mode() {
             return;
         }
@@ -1524,7 +2043,12 @@ impl Editor {
         self.changed(window, cx);
     }
 
-    fn on_select_word_right(&mut self, _: &k::SelectWordRight, window: &mut Window, cx: &mut Context<Self>) {
+    fn on_select_word_right(
+        &mut self,
+        _: &k::SelectWordRight,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if !self.guard(window, cx) || self.core.in_block_mode() {
             return;
         }
@@ -1554,7 +2078,12 @@ impl Editor {
         self.changed(window, cx);
     }
 
-    fn on_select_line_start(&mut self, _: &k::SelectLineStart, window: &mut Window, cx: &mut Context<Self>) {
+    fn on_select_line_start(
+        &mut self,
+        _: &k::SelectLineStart,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if !self.guard(window, cx) || self.core.in_block_mode() {
             return;
         }
@@ -1564,7 +2093,12 @@ impl Editor {
         self.changed(window, cx);
     }
 
-    fn on_select_line_end(&mut self, _: &k::SelectLineEnd, window: &mut Window, cx: &mut Context<Self>) {
+    fn on_select_line_end(
+        &mut self,
+        _: &k::SelectLineEnd,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if !self.guard(window, cx) || self.core.in_block_mode() {
             return;
         }
@@ -1599,7 +2133,12 @@ impl Editor {
         self.changed(window, cx);
     }
 
-    fn on_select_to_doc_start(&mut self, _: &k::SelectToDocStart, window: &mut Window, cx: &mut Context<Self>) {
+    fn on_select_to_doc_start(
+        &mut self,
+        _: &k::SelectToDocStart,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if !self.guard(window, cx) {
             return;
         }
@@ -1608,7 +2147,12 @@ impl Editor {
         self.changed(window, cx);
     }
 
-    fn on_select_to_doc_end(&mut self, _: &k::SelectToDocEnd, window: &mut Window, cx: &mut Context<Self>) {
+    fn on_select_to_doc_end(
+        &mut self,
+        _: &k::SelectToDocEnd,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if !self.guard(window, cx) {
             return;
         }
@@ -1654,7 +2198,12 @@ impl Editor {
         self.changed(window, cx);
     }
 
-    fn on_delete_word_back(&mut self, _: &k::DeleteWordBack, window: &mut Window, cx: &mut Context<Self>) {
+    fn on_delete_word_back(
+        &mut self,
+        _: &k::DeleteWordBack,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if !self.guard(window, cx) {
             return;
         }
@@ -1669,7 +2218,12 @@ impl Editor {
         self.changed(window, cx);
     }
 
-    fn on_delete_word_forward(&mut self, _: &k::DeleteWordForward, window: &mut Window, cx: &mut Context<Self>) {
+    fn on_delete_word_forward(
+        &mut self,
+        _: &k::DeleteWordForward,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if !self.guard(window, cx) {
             return;
         }
@@ -1680,10 +2234,17 @@ impl Editor {
             self.core.delete_selected_blocks();
         } else if self.core.sel.is_collapsed() {
             let h = self.core.sel.head;
-            let text = self.core.text_of(h.block).map(|t| t.text.clone()).unwrap_or_default();
+            let text = self
+                .core
+                .text_of(h.block)
+                .map(|t| t.text.clone())
+                .unwrap_or_default();
             if h.offset < text.len() {
                 let e = core::next_word(&text, h.offset);
-                self.core.sel = Selection { anchor: h, head: Pos::new(h.block, e) };
+                self.core.sel = Selection {
+                    anchor: h,
+                    head: Pos::new(h.block, e),
+                };
                 self.core.delete_selection();
             } else {
                 self.core.delete_forward();
@@ -1694,7 +2255,12 @@ impl Editor {
         self.changed(window, cx);
     }
 
-    fn on_delete_to_line_start(&mut self, _: &k::DeleteToLineStart, window: &mut Window, cx: &mut Context<Self>) {
+    fn on_delete_to_line_start(
+        &mut self,
+        _: &k::DeleteToLineStart,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if !self.guard(window, cx) {
             return;
         }
@@ -1722,9 +2288,16 @@ impl Editor {
         } else if self.core.is_code(self.core.sel.head.block) && self.core.sel.is_collapsed() {
             // Newline keeps the current line's indentation.
             let h = self.core.sel.head;
-            let text = self.core.text_of(h.block).map(|t| t.text.clone()).unwrap_or_default();
+            let text = self
+                .core
+                .text_of(h.block)
+                .map(|t| t.text.clone())
+                .unwrap_or_default();
             let line_start = text[..h.offset].rfind('\n').map(|i| i + 1).unwrap_or(0);
-            let indent: String = text[line_start..h.offset].chars().take_while(|c| *c == ' ' || *c == '\t').collect();
+            let indent: String = text[line_start..h.offset]
+                .chars()
+                .take_while(|c| *c == ' ' || *c == '\t')
+                .collect();
             self.core.break_coalescing();
             self.core.insert_text(&format!("\n{indent}"));
             self.core.break_coalescing();
@@ -1735,7 +2308,8 @@ impl Editor {
     }
 
     fn on_soft_break(&mut self, _: &k::SoftBreak, window: &mut Window, cx: &mut Context<Self>) {
-        if !self.guard(window, cx) || self.core.in_block_mode() || self.core.sel.head.block == TITLE {
+        if !self.guard(window, cx) || self.core.in_block_mode() || self.core.sel.head.block == TITLE
+        {
             return;
         }
         self.core.break_coalescing();
@@ -1775,17 +2349,567 @@ impl Editor {
         if !self.core.in_block_mode() && self.core.is_code(self.core.sel.head.block) {
             // Remove up to 4 leading spaces of the current line.
             let h = self.core.sel.head;
-            let text = self.core.text_of(h.block).map(|t| t.text.clone()).unwrap_or_default();
+            let text = self
+                .core
+                .text_of(h.block)
+                .map(|t| t.text.clone())
+                .unwrap_or_default();
             let ls = text[..h.offset].rfind('\n').map(|i| i + 1).unwrap_or(0);
             let n = text[ls..].chars().take(4).take_while(|c| *c == ' ').count();
             if n > 0 {
                 self.core.checkpoint(core::EditKind::Other);
-                self.core.text_mut(h.block).unwrap().replace(ls..ls + n, &RichText::default());
-                self.core.sel = Selection::caret(Pos::new(h.block, h.offset.saturating_sub(n).max(ls)));
+                self.core
+                    .text_mut(h.block)
+                    .unwrap()
+                    .replace(ls..ls + n, &RichText::default());
+                self.core.sel =
+                    Selection::caret(Pos::new(h.block, h.offset.saturating_sub(n).max(ls)));
             }
         } else if self.core.in_block_mode() || !self.core.cell_step(false) {
             self.core.outdent();
         }
+        self.changed(window, cx);
+    }
+
+    /// Vim mode is on and the current mode swallows typed text (Normal/Visual).
+    pub(super) fn vim_blocks_input(&self) -> bool {
+        crate::settings::vim() && self.vim_mode != VimMode::Insert
+    }
+
+    /// `r`, `m`, `` ` ``, or `'` is waiting for its next character — the key
+    /// context drops `vim` for that one keystroke (see `on_vim_replace`).
+    pub(super) fn vim_awaiting_char(&self) -> bool {
+        self.vim_replace_pending || self.vim_mark_pending.is_some()
+    }
+
+    /// Switch to Insert mode and show the bar caret (`changed` restarts the blink).
+    fn enter_insert(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.vim_mode = VimMode::Insert;
+        self.changed(window, cx);
+    }
+
+    fn on_insert_here(&mut self, _: &k::InsertHere, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.guard(window, cx) { return; }
+        self.enter_insert(window, cx);
+    }
+
+    fn on_insert_after(&mut self, _: &k::InsertAfter, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.guard(window, cx) || self.core.in_block_mode() { return; }
+        self.goal_x = None;
+        self.move_h(true, false, false);
+        self.enter_insert(window, cx);
+    }
+
+    fn on_insert_line_start(&mut self, _: &k::InsertLineStart, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.guard(window, cx) || self.core.in_block_mode() { return; }
+        self.goal_x = None;
+        self.line_edge(false, false);
+        self.enter_insert(window, cx);
+    }
+
+    fn on_insert_line_end(&mut self, _: &k::InsertLineEnd, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.guard(window, cx) || self.core.in_block_mode() { return; }
+        self.goal_x = None;
+        self.line_edge(true, false);
+        self.enter_insert(window, cx);
+    }
+
+    fn on_open_below(&mut self, _: &k::OpenBelow, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.guard(window, cx) || self.core.in_block_mode() { return; }
+        // Open a line below: go to the line end, switch to Insert, then split
+        // the paragraph (the direct `on_enter` call does its own `changed`).
+        self.goal_x = None;
+        self.line_edge(true, false);
+        self.vim_mode = VimMode::Insert;
+        self.on_enter(&k::Enter, window, cx);
+    }
+
+    fn on_open_above(&mut self, _: &k::OpenAbove, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.guard(window, cx) || self.core.in_block_mode() { return; }
+        // Open a line above: split at the line start, then step up into the
+        // new empty block left above the original content.
+        self.goal_x = None;
+        self.line_edge(false, false);
+        self.vim_mode = VimMode::Insert;
+        self.on_enter(&k::Enter, window, cx);
+        self.move_v(false, false);
+        self.changed(window, cx);
+    }
+
+    fn on_vim_delete_char(&mut self, _: &k::VimDeleteChar, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.guard(window, cx) || self.core.in_block_mode() { return; }
+        // nvim `x`: only remove a char sitting under the caret, never join lines.
+        if self.core.sel.is_collapsed() {
+            let h = self.core.sel.head;
+            let len = self.core.text_of(h.block).map(|t| t.len()).unwrap_or(0);
+            if h.offset >= len { return; }
+        }
+        self.on_delete(&k::Delete, window, cx);
+    }
+
+    /// Arm operator `op`, or — if it is already armed — run its line-wise form
+    /// (`dd`/`cc`/`yy`, operator pressed twice).
+    fn vim_operator(&mut self, op: VimOp, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.guard(window, cx) || self.core.in_block_mode() { return; }
+        if matches!(self.vim_pending_op, Some((p, _)) if p == op) {
+            self.vim_pending_op = None;
+            match op {
+                VimOp::Delete => self.vim_delete_line(window, cx),
+                VimOp::Yank => self.vim_yank_line(window, cx),
+                VimOp::Change => self.vim_change_line(window, cx),
+            }
+        } else {
+            self.vim_pending_op = Some((op, self.core.sel.head));
+            cx.notify();
+        }
+    }
+
+    fn on_vim_op_delete(&mut self, _: &k::VimOpDelete, window: &mut Window, cx: &mut Context<Self>) {
+        self.vim_operator(VimOp::Delete, window, cx);
+    }
+    fn on_vim_op_change(&mut self, _: &k::VimOpChange, window: &mut Window, cx: &mut Context<Self>) {
+        self.vim_operator(VimOp::Change, window, cx);
+    }
+    fn on_vim_op_yank(&mut self, _: &k::VimOpYank, window: &mut Window, cx: &mut Context<Self>) {
+        self.vim_operator(VimOp::Yank, window, cx);
+    }
+
+    /// Apply a pending operator to the span from where it was armed (`anchor`)
+    /// to the motion's landing point (the current caret).
+    fn apply_vim_op(&mut self, op: VimOp, anchor: Pos, window: &mut Window, cx: &mut Context<Self>) {
+        self.apply_vim_op_to(op, Selection { anchor, head: self.core.sel.head }, window, cx);
+    }
+
+    /// Apply a pending operator to an explicit range (a text object's span).
+    fn apply_vim_op_to(&mut self, op: VimOp, sel: Selection, window: &mut Window, cx: &mut Context<Self>) {
+        self.core.sel = sel;
+        match op {
+            VimOp::Yank => {
+                self.copy_selection(cx);
+                set_vim_yank_kind(VimYankKind::Char);
+                // nvim leaves the caret at the start of the yanked span.
+                self.core.sel = Selection::caret(self.core.ordered().0);
+            }
+            VimOp::Delete => self.core.delete_selection(),
+            VimOp::Change => {
+                self.core.delete_selection();
+                self.vim_mode = VimMode::Insert;
+            }
+        }
+        self.changed(window, cx);
+    }
+
+    fn on_vim_textobj_inner(&mut self, _: &k::VimTextObjInner, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.guard(window, cx) || self.vim_pending_op.is_none() { return; }
+        self.vim_textobj_pending = Some(false);
+        cx.notify();
+    }
+    fn on_vim_textobj_around(&mut self, _: &k::VimTextObjAround, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.guard(window, cx) || self.vim_pending_op.is_none() { return; }
+        self.vim_textobj_pending = Some(true);
+        cx.notify();
+    }
+
+    /// Resolve text object `obj` at the caret and apply the pending operator
+    /// to it, ending both the operator and the text-object wait.
+    fn vim_apply_textobj(&mut self, obj: TextObj, window: &mut Window, cx: &mut Context<Self>) {
+        let (Some(around), Some((op, _))) = (self.vim_textobj_pending.take(), self.vim_pending_op.take()) else { return; };
+        let block = self.core.sel.head.block;
+        let Some(range) = self.core.text_object(obj, around) else { return; };
+        let sel = Selection { anchor: Pos::new(block, range.start), head: Pos::new(block, range.end) };
+        self.apply_vim_op_to(op, sel, window, cx);
+    }
+
+    fn on_vim_obj_word(&mut self, _: &k::VimObjWord, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.guard(window, cx) { return; }
+        self.vim_apply_textobj(TextObj::Word, window, cx);
+    }
+    fn on_vim_obj_para(&mut self, _: &k::VimObjPara, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.guard(window, cx) { return; }
+        self.vim_apply_textobj(TextObj::Para, window, cx);
+    }
+    fn on_vim_obj_quote_d(&mut self, _: &k::VimObjQuoteD, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.guard(window, cx) { return; }
+        self.vim_apply_textobj(TextObj::Quote('"'), window, cx);
+    }
+    fn on_vim_obj_quote_s(&mut self, _: &k::VimObjQuoteS, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.guard(window, cx) { return; }
+        self.vim_apply_textobj(TextObj::Quote('\''), window, cx);
+    }
+    fn on_vim_obj_quote_bt(&mut self, _: &k::VimObjQuoteBt, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.guard(window, cx) { return; }
+        self.vim_apply_textobj(TextObj::Quote('`'), window, cx);
+    }
+    fn on_vim_obj_paren(&mut self, _: &k::VimObjParen, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.guard(window, cx) { return; }
+        self.vim_apply_textobj(TextObj::Bracket('(', ')'), window, cx);
+    }
+    fn on_vim_obj_brace(&mut self, _: &k::VimObjBrace, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.guard(window, cx) { return; }
+        self.vim_apply_textobj(TextObj::Bracket('{', '}'), window, cx);
+    }
+    fn on_vim_obj_bracket(&mut self, _: &k::VimObjBracket, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.guard(window, cx) { return; }
+        self.vim_apply_textobj(TextObj::Bracket('[', ']'), window, cx);
+    }
+    fn on_vim_obj_angle(&mut self, _: &k::VimObjAngle, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.guard(window, cx) { return; }
+        self.vim_apply_textobj(TextObj::Bracket('<', '>'), window, cx);
+    }
+
+    /// `/` and `?`: a minimal bottom-docked prompt (not the ⌘F popover),
+    /// reusing `find_field` and the find engine. nvim's forward vs. backward
+    /// first-search distinction isn't modeled — both search forward; use `N`
+    /// afterward to go backward.
+    fn vim_open_search(&mut self, prefix: char, window: &mut Window, cx: &mut Context<Self>) {
+        self.vim_search_prefix = prefix;
+        self.vim_search_bar = true;
+        self.vim_search_quiet = true;
+        self.find = Some(super::find::Find { replace: false, matches: vec![], current: None });
+        self.slash = None;
+        self.menu = None;
+        self.find_field.update(cx, |f, cx| {
+            f.set_text("", cx);
+            f.size = 13.;
+            f.line_height = 20.;
+        });
+        self.refresh_find(true, cx);
+        let field = self.find_field.clone();
+        window.focus(&field.focus_handle(cx));
+        cx.notify();
+    }
+
+    fn on_vim_search_open(&mut self, _: &k::VimSearchOpen, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.guard(window, cx) { return; }
+        self.vim_open_search('/', window, cx);
+    }
+    fn on_vim_search_open_back(&mut self, _: &k::VimSearchOpenBack, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.guard(window, cx) { return; }
+        self.vim_open_search('?', window, cx);
+    }
+
+    /// Enter in the search bar: close it and land the caret on the match
+    /// found while typing (the highlight and `find` state stay live for `n`/`N`).
+    pub(super) fn vim_search_confirm(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.vim_search_bar = false;
+        window.focus(&self.focus);
+        self.vim_search_jump(window, cx);
+    }
+
+    /// Esc in the search bar: cancel — no jump, no highlight, caret untouched.
+    pub(super) fn vim_search_cancel(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.vim_search_bar = false;
+        self.find = None;
+        window.focus(&self.focus);
+        cx.notify();
+    }
+
+    /// `n`/`N`: step through the last search and land the caret on the hit
+    /// (unlike the find box, which only selects the hit until it's closed).
+    /// If the box isn't open, resume from the query still held by
+    /// `find_field` (its text outlives the box being closed).
+    fn vim_search_step(&mut self, forward: bool, window: &mut Window, cx: &mut Context<Self>) {
+        if self.find.is_none() {
+            if self.find_field.read(cx).text.is_empty() { return; }
+            self.vim_search_quiet = true;
+            self.find = Some(super::find::Find { replace: false, matches: vec![], current: None });
+            self.refresh_find(true, cx);
+        }
+        self.step_find(forward, window, cx);
+        self.vim_search_jump(window, cx);
+    }
+
+    fn on_vim_search_next(&mut self, _: &k::VimSearchNext, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.guard(window, cx) { return; }
+        self.vim_search_step(true, window, cx);
+    }
+    fn on_vim_search_prev(&mut self, _: &k::VimSearchPrev, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.guard(window, cx) { return; }
+        self.vim_search_step(false, window, cx);
+    }
+
+    /// `*`/`#` (and the `g*`/`g#` aliases — no whole-word distinction here):
+    /// search for the word under the caret, skipping the occurrence it's on.
+    fn vim_search_word(&mut self, forward: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(range) = self.core.text_object(TextObj::Word, false) else { return };
+        let block = self.core.sel.head.block;
+        let Some(word) = self.core.text_of(block).map(|t| t.text[range.clone()].to_string()) else { return };
+        if word.trim().is_empty() { return; }
+        self.find_field.update(cx, |f, cx| f.set_text(&word, cx));
+        self.vim_search_quiet = true;
+        self.find = Some(super::find::Find { replace: false, matches: vec![], current: None });
+        // Anchor just past the word (forward) or at its start (backward) so
+        // the search always skips the occurrence the caret is already on.
+        let saved = self.core.sel;
+        self.core.sel = Selection::caret(Pos::new(block, if forward { range.end } else { range.start }));
+        self.refresh_find(true, cx);
+        self.core.sel = saved;
+        if !forward {
+            self.step_find(false, window, cx);
+        }
+        self.vim_search_jump(window, cx);
+    }
+
+    fn on_vim_search_word_fwd(&mut self, _: &k::VimSearchWordFwd, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.guard(window, cx) { return; }
+        self.vim_search_word(true, window, cx);
+    }
+    fn on_vim_search_word_back(&mut self, _: &k::VimSearchWordBack, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.guard(window, cx) { return; }
+        self.vim_search_word(false, window, cx);
+    }
+
+    /// Collapse the caret onto the current search hit (the find box only
+    /// highlights/scrolls to it until closed; Vim commands jump immediately).
+    fn vim_search_jump(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some((id, r)) = self.find.as_ref().and_then(|f| f.matches.get(f.current?).cloned()) {
+            self.core.block_sel = None;
+            self.core.sel = Selection::caret(Pos::new(id, r.start));
+        }
+        self.changed(window, cx);
+    }
+
+    fn vim_delete_line(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let h = self.core.sel.head.block;
+        if h == TITLE { return; } // keep the document title
+        self.core.delete_block(h); // checkpoints and repositions the caret
+        self.changed(window, cx);
+    }
+
+    fn vim_yank_line(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let h = self.core.sel.head.block;
+        let Some(len) = self.core.text_of(h).map(|t| t.len()) else { return; };
+        // Copy the whole line by selecting it, then restore the caret.
+        let saved = self.core.sel;
+        self.core.sel = Selection { anchor: Pos::new(h, 0), head: Pos::new(h, len) };
+        self.copy_selection(cx);
+        set_vim_yank_kind(VimYankKind::Line);
+        self.core.sel = saved;
+        self.changed(window, cx);
+    }
+
+    fn vim_change_line(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let h = self.core.sel.head.block;
+        let Some(len) = self.core.text_of(h).map(|t| t.len()) else { return; };
+        // Clear the line's text (keep the block) and drop into Insert.
+        self.core.sel = Selection { anchor: Pos::new(h, 0), head: Pos::new(h, len) };
+        self.core.delete_selection();
+        self.vim_mode = VimMode::Insert;
+        self.changed(window, cx);
+    }
+
+    /// Return to Normal, clearing any Visual selection — both the whole-block
+    /// one (Visual Line) and the charwise caret range.
+    fn vim_to_normal(&mut self) {
+        self.vim_mode = VimMode::Normal;
+        self.core.clear_block_sel();
+        self.core.sel = Selection::caret(self.core.sel.head);
+    }
+
+    fn on_vim_visual(&mut self, _: &k::VimVisual, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.guard(window, cx) { return; }
+        if self.vim_mode == VimMode::Visual {
+            self.vim_to_normal();
+        } else {
+            // Normal or Visual Line → charwise Visual (drop any block selection).
+            self.core.clear_block_sel();
+            self.vim_mode = VimMode::Visual;
+        }
+        self.changed(window, cx);
+    }
+
+    fn on_vim_visual_line(&mut self, _: &k::VimVisualLine, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.guard(window, cx) { return; }
+        if self.vim_mode == VimMode::VisualLine {
+            self.vim_to_normal();
+        } else {
+            // Normal or charwise Visual → line-wise: drop any char selection,
+            // then select the caret's whole block.
+            self.core.sel = Selection::caret(self.core.sel.head);
+            self.core.select_block(self.core.sel.head.block);
+            self.vim_mode = VimMode::VisualLine;
+        }
+        self.changed(window, cx);
+    }
+
+    fn on_vim_visual_block(&mut self, _: &k::VimVisualBlock, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.guard(window, cx) { return; }
+        if self.vim_mode == VimMode::VisualBlock {
+            self.vim_to_normal();
+        } else {
+            // Start a columnar selection from the caret (Select* motions grow it,
+            // reinterpreted as a rectangle by the render / columnar ops).
+            self.core.clear_block_sel();
+            self.vim_mode = VimMode::VisualBlock;
+        }
+        self.changed(window, cx);
+    }
+
+    /// Visual Block j/k: move the head one line at the same column, keeping the
+    /// anchor — `move_v`'s collapsing path preserves the column (and `goal_x`),
+    /// so we reuse it and restore the anchor to extend the rectangle.
+    fn vblock_extend_v(&mut self, down: bool, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.guard(window, cx) { return; }
+        let anchor = self.core.sel.anchor;
+        self.move_v(down, false);
+        self.core.sel.anchor = anchor;
+        self.changed(window, cx);
+    }
+
+    fn on_vim_block_down(&mut self, _: &k::VimBlockDown, window: &mut Window, cx: &mut Context<Self>) {
+        self.vblock_extend_v(true, window, cx);
+    }
+
+    fn on_vim_block_up(&mut self, _: &k::VimBlockUp, window: &mut Window, cx: &mut Context<Self>) {
+        self.vblock_extend_v(false, window, cx);
+    }
+
+    fn on_vim_visual_block_delete(&mut self, _: &k::VimVisualBlockDelete, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.guard(window, cx) { return; }
+        self.core.delete_columns();
+        self.vim_mode = VimMode::Normal;
+        self.changed(window, cx);
+    }
+
+    fn on_vim_visual_block_yank(&mut self, _: &k::VimVisualBlockYank, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.guard(window, cx) { return; }
+        cx.write_to_clipboard(ClipboardItem::new_string(self.core.columns_text()));
+        set_vim_yank_kind(VimYankKind::Block);
+        self.vim_to_normal();
+        self.changed(window, cx);
+    }
+
+    fn on_vim_replace(&mut self, _: &k::VimReplace, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.guard(window, cx) || self.core.in_block_mode() { return; }
+        // Arm replace; the re-render drops `vim` from the key context so the
+        // next character reaches `replace_text_in_range`.
+        self.vim_replace_pending = true;
+        cx.notify();
+    }
+
+    fn vim_arm_mark(&mut self, op: VimMarkOp, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.guard(window, cx) { return; }
+        self.vim_mark_pending = Some(op);
+        cx.notify();
+    }
+    fn on_vim_mark_set(&mut self, _: &k::VimMarkSet, window: &mut Window, cx: &mut Context<Self>) {
+        self.vim_arm_mark(VimMarkOp::Set, window, cx);
+    }
+    fn on_vim_mark_jump_exact(&mut self, _: &k::VimMarkJumpExact, window: &mut Window, cx: &mut Context<Self>) {
+        self.vim_arm_mark(VimMarkOp::JumpExact, window, cx);
+    }
+    fn on_vim_mark_jump_line(&mut self, _: &k::VimMarkJumpLine, window: &mut Window, cx: &mut Context<Self>) {
+        self.vim_arm_mark(VimMarkOp::JumpLineStart, window, cx);
+    }
+
+    fn on_vim_command(&mut self, _: &k::VimCommand, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.guard(window, cx) { return; }
+        self.vim_cmd_open = true;
+        self.vim_cmd.update(cx, |f, cx| f.set_text("", cx));
+        window.focus(&self.vim_cmd.focus_handle(cx));
+        cx.notify();
+    }
+
+    /// Closing the bar for any reason (Escape, Submit, losing focus) always
+    /// reverts a live substitute preview and drops its pattern highlight —
+    /// `run_vim_command` calls this *before* actually running the command,
+    /// so the real edit (if any) starts from a clean, un-previewed document.
+    fn close_vim_command(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.vim_sub_revert(cx);
+        self.find = None;
+        self.vim_cmd_open = false;
+        window.focus(&self.focus);
+        cx.notify();
+    }
+
+    /// `vim_cmd`'s text changed: live-highlight a `:s`/`:%s` pattern while
+    /// it's being typed, then switch to a live, uncommitted preview of the
+    /// replacement once the second `/` appears (see `VimSubPreview`).
+    fn on_vim_cmd_changed(&mut self, cx: &mut Context<Self>) {
+        let cmd = self.vim_cmd.read(cx).text.clone();
+        match parse_vim_substitute_live(&cmd) {
+            Some(VimSubLive::Pattern { whole_doc, pat }) => {
+                self.vim_sub_revert(cx);
+                self.vim_sub_highlight_pattern(whole_doc, &pat, cx);
+            }
+            Some(VimSubLive::Replace { whole_doc, pat, repl, global }) => {
+                let stale = self.vim_sub_preview.as_ref().is_none_or(|p| p.whole_doc != whole_doc || p.pat != pat);
+                if stale {
+                    self.vim_sub_revert(cx);
+                    self.find = None;
+                    self.vim_sub_enter_replace(whole_doc, &pat, cx);
+                }
+                self.vim_sub_update_preview(&repl, global, cx);
+            }
+            None => {
+                self.vim_sub_revert(cx);
+                self.find = None;
+                cx.notify();
+            }
+        }
+    }
+
+    /// Run an ex command: `:w` save, `:q`/`:q!` leave, `:wq`/`:x` both, `:<n>`
+    /// jump to the nth line, `:s`/`:%s` substitute. Unknown commands are ignored.
+    fn run_vim_command(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let cmd = self.vim_cmd.read(cx).text.trim().trim_start_matches(':').to_string();
+        self.close_vim_command(window, cx);
+        if let Some(sub) = parse_vim_substitute_live(&cmd) {
+            // `:s/pat` with no closing slash at all is still valid vim —
+            // shorthand for "replace with nothing" — same as an explicit `//`.
+            let (whole_doc, pat, repl, global) = match sub {
+                VimSubLive::Replace { whole_doc, pat, repl, global } => (whole_doc, pat, repl, global),
+                VimSubLive::Pattern { whole_doc, pat } => (whole_doc, pat, String::new(), false),
+            };
+            if !pat.is_empty() {
+                self.vim_substitute(whole_doc, &pat, &repl, global, window, cx);
+            }
+            return;
+        }
+        let (save, quit) = match cmd.as_str() {
+            "w" | "write" => (true, false),
+            "q" | "q!" | "quit" => (false, true),
+            "wq" | "x" => (true, true),
+            n => {
+                if let Ok(line) = n.parse::<usize>() {
+                    self.vim_goto_line(line, window, cx);
+                }
+                (false, false)
+            }
+        };
+        if save {
+            self.core.break_coalescing();
+            cx.emit(EditorEvent::Save);
+        }
+        if quit {
+            window.dispatch_action(Box::new(crate::app::GoHome), cx);
+        }
+    }
+
+    /// Put the caret at the start of the nth text line (1-based, clamped).
+    fn vim_goto_line(&mut self, line: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let units = self.core.units();
+        let texts: Vec<_> = units.iter().filter(|u| u.text).collect();
+        if texts.is_empty() { return; }
+        let i = line.saturating_sub(1).min(texts.len() - 1);
+        self.core.sel = Selection::caret(Pos::new(texts[i].id, 0));
+        self.changed(window, cx);
+    }
+
+    fn on_vim_visual_delete(&mut self, _: &k::VimVisualDelete, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.guard(window, cx) { return; }
+        // `on_delete` deletes the block selection in Visual Line, else the
+        // charwise selection; both leave a valid caret.
+        self.vim_mode = VimMode::Normal;
+        self.on_delete(&k::Delete, window, cx);
+    }
+
+    fn on_vim_visual_yank(&mut self, _: &k::VimVisualYank, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.guard(window, cx) { return; }
+        let line_wise = self.core.in_block_mode(); // Visual Line's backing store
+        self.copy_selection(cx); // handles both block and charwise selections
+        set_vim_yank_kind(if line_wise { VimYankKind::Line } else { VimYankKind::Char });
+        self.vim_to_normal();
         self.changed(window, cx);
     }
 
@@ -1802,13 +2926,31 @@ impl Editor {
         if self.cropping() {
             return self.cancel_crop(cx);
         }
+        if self.vim_awaiting_char() {
+            // `r`/`m`/`` ` ``/`'` then Esc cancels, instead of the next
+            // keystroke being consumed as a replacement/mark name.
+            self.vim_replace_pending = false;
+            self.vim_mark_pending = None;
+            cx.notify();
+            return;
+        }
         if self.mention.is_some() {
             self.mention = None;
         } else if self.slash.is_some() || self.menu.is_some() {
             self.slash = None;
             self.menu = None;
-        } else if self.find.is_some() {
+        } else if self.find.is_some() && !self.vim_search_quiet {
             return self.close_find(window, cx);
+        } else if crate::settings::vim() && self.vim_mode != VimMode::Normal {
+            // Leave Insert/Visual for Normal, as Esc does in nvim (the tail
+            // `changed` repaints the block caret). Leaving Visual clears the
+            // selection.
+            self.vim_to_normal();
+        } else if crate::settings::vim() && self.find.is_some() {
+            // Already in Normal: a second Esc clears the lingering Vim
+            // search highlight, instead of falling into 块选择模式 below
+            // (off while Vim is on — nvim's Esc never starts that).
+            self.find = None;
         } else if self.read_only {
             // Nothing to select blocks for.
             self.core.sel = Selection::caret(self.core.sel.head);
@@ -1816,7 +2958,10 @@ impl Editor {
             self.core.cell_sel = None;
         } else if self.core.in_block_mode() {
             self.core.clear_block_sel();
-        } else {
+        } else if !crate::settings::vim() {
+            // 块选择模式 ("move between lines" via repeated Esc): a
+            // non-Vim feature. With Vim on, Esc settles into Normal and
+            // stops there instead.
             let h = self.core.sel.head.block;
             self.core.select_block(h);
         }
@@ -1839,16 +2984,27 @@ impl Editor {
 
     fn copy_selection(&mut self, cx: &mut Context<Self>) -> bool {
         let cells = self.core.cell_sel.is_some();
-        let blocks = if cells { self.core.selected_cells_content() } else { self.core.selected_blocks_content() };
+        let blocks = if cells {
+            self.core.selected_cells_content()
+        } else {
+            self.core.selected_blocks_content()
+        };
         let text = if self.core.in_block_mode() || cells {
-            Document { blocks: blocks.clone(), ..Default::default() }.plain_text()
+            Document {
+                blocks: blocks.clone(),
+                ..Default::default()
+            }
+            .plain_text()
         } else {
             if self.core.sel.is_collapsed() {
                 return false;
             }
             self.core.selected_text()
         };
-        let xml = docxml::serialize(&Document { blocks, ..Default::default() });
+        let xml = docxml::serialize(&Document {
+            blocks,
+            ..Default::default()
+        });
         cx.write_to_clipboard(ClipboardItem::new_string_with_json_metadata(text, xml));
         true
     }
@@ -1858,14 +3014,26 @@ impl Editor {
     pub fn copy_markdown(&mut self, cx: &mut Context<Self>) {
         let cells = self.core.cell_sel.is_some();
         let whole = !cells && !self.core.in_block_mode() && self.core.sel.is_collapsed();
-        let blocks = if cells { self.core.selected_cells_content() } else if whole { self.core.doc.blocks.clone() } else { self.core.selected_blocks_content() };
+        let blocks = if cells {
+            self.core.selected_cells_content()
+        } else if whole {
+            self.core.doc.blocks.clone()
+        } else {
+            self.core.selected_blocks_content()
+        };
         // A Markdown file's title is its file name, not a line in it.
         let title = (whole && !self.markdown).then(|| self.core.doc.title.plain_text());
-        let text = crate::markdown::clipboard(title.as_deref(), &blocks, &crate::store::Store::root_dir());
+        let text =
+            crate::markdown::clipboard(title.as_deref(), &blocks, &crate::store::Store::root_dir());
         cx.write_to_clipboard(ClipboardItem::new_string(text));
     }
 
-    fn on_copy_markdown(&mut self, _: &k::CopyMarkdown, window: &mut Window, cx: &mut Context<Self>) {
+    fn on_copy_markdown(
+        &mut self,
+        _: &k::CopyMarkdown,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if self.guard(window, cx) {
             self.copy_markdown(cx);
         }
@@ -1898,6 +3066,38 @@ impl Editor {
         self.paste(false, window, cx);
     }
 
+    /// Vim `p`: paste according to how the content was yanked — a plain
+    /// paste at the caret (`VimYankKind::Char`, e.g. `yw`/`y$`), a new line
+    /// below (`yy`/Visual Line `y`), or a column-preserving rectangle
+    /// (Visual Block `y`). `d`/`c` don't set a yank kind (see
+    /// `VIM_YANK_KIND`'s doc comment) — deleting then pasting back is not
+    /// wired up, only yank is.
+    fn on_vim_paste(&mut self, _: &k::VimPaste, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.guard(window, cx) || self.core.in_block_mode() { return; }
+        match vim_yank_kind() {
+            VimYankKind::Char => self.paste(false, window, cx),
+            VimYankKind::Line => {
+                let after = self.core.sel.head.block;
+                self.core.checkpoint(core::EditKind::Other);
+                let b = Block::text("");
+                let id = b.id;
+                self.core.insert_after(after, b);
+                self.core.sel = Selection::caret(Pos::new(id, 0));
+                self.paste(false, window, cx);
+            }
+            VimYankKind::Block => {
+                // Honor the UI test harness's fake clipboard, like `paste()` does
+                // (tools/harness never touches the real system clipboard).
+                let fake = crate::clipboard::FAKE_CLIPBOARD.lock().unwrap().clone();
+                let Some(text) = fake.map(|f| f.text).or_else(|| cx.read_from_clipboard().and_then(|i| i.text())) else { return };
+                let lines: Vec<String> = text.lines().map(str::to_string).collect();
+                let col = self.core.sel.head.offset;
+                self.core.insert_columns(&lines, col);
+                self.changed(window, cx);
+            }
+        }
+    }
+
     /// ⌘⇧V 粘贴为纯文本: the characters as they are, no Markdown parsing.
     fn on_paste_plain(&mut self, _: &k::PastePlain, window: &mut Window, cx: &mut Context<Self>) {
         self.paste(true, window, cx);
@@ -1908,20 +3108,36 @@ impl Editor {
             return;
         }
         let fake = crate::clipboard::FAKE_CLIPBOARD.lock().unwrap().clone();
-        let item = if fake.is_some() { None } else { cx.read_from_clipboard() };
+        let item = if fake.is_some() {
+            None
+        } else {
+            cx.read_from_clipboard()
+        };
         let (text, meta, image) = match (&fake, &item) {
-            (Some(f), _) => (Some(f.text.clone()), None, (!f.images.is_empty()).then(|| f.images.iter().collect::<Vec<_>>())),
+            (Some(f), _) => (
+                Some(f.text.clone()),
+                None,
+                (!f.images.is_empty()).then(|| f.images.iter().collect::<Vec<_>>()),
+            ),
             (None, Some(item)) => {
                 let s = item.entries().iter().find_map(|e| match e {
                     ClipboardEntry::String(s) => Some(s),
                     _ => None,
                 });
-                let images: Vec<_> = item.entries().iter().filter_map(|e| match e {
-                    ClipboardEntry::Image(img) => Some(img),
-                    _ => None,
-                }).collect();
+                let images: Vec<_> = item
+                    .entries()
+                    .iter()
+                    .filter_map(|e| match e {
+                        ClipboardEntry::Image(img) => Some(img),
+                        _ => None,
+                    })
+                    .collect();
                 let image = (!images.is_empty()).then_some(images);
-                (s.map(|s| s.text().clone()), s.and_then(|s| s.metadata_json::<String>()), image)
+                (
+                    s.map(|s| s.text().clone()),
+                    s.and_then(|s| s.metadata_json::<String>()),
+                    image,
+                )
             }
             (None, None) => return,
         };
@@ -1934,10 +3150,16 @@ impl Editor {
         }
         let head = self.core.sel.head.block;
         let rich_target = head != TITLE && !self.core.is_code(head);
-        let internal = meta.and_then(|xml| docxml::parse(&xml).ok()).filter(|d| !d.blocks.is_empty());
+        let internal = meta
+            .and_then(|xml| docxml::parse(&xml).ok())
+            .filter(|d| !d.blocks.is_empty());
         let html = match &fake {
             Some(f) => f.html.clone(),
-            None if !plain && internal.is_none() && rich_target && !text.as_deref().is_some_and(crate::paste::has_math) => {
+            None if !plain
+                && internal.is_none()
+                && rich_target
+                && !text.as_deref().is_some_and(crate::paste::has_math) =>
+            {
                 crate::clipboard::clipboard_html()
             }
             None => None,
@@ -1954,7 +3176,13 @@ impl Editor {
                 matches!(one.kind, BlockKind::Text)
                     && one.children.is_empty()
                     && one.text.text == t.trim()
-                    && one.text.spans().all(|(_, m)| m.link.as_deref().is_none_or(|l| l == t.trim()) && Marks { link: None, ..m.clone() } == Marks::default())
+                    && one.text.spans().all(|(_, m)| {
+                        m.link.as_deref().is_none_or(|l| l == t.trim())
+                            && Marks {
+                                link: None,
+                                ..m.clone()
+                            } == Marks::default()
+                    })
             }
             _ => false,
         };
@@ -1967,12 +3195,18 @@ impl Editor {
             }
         } else if let Some(d) = internal {
             self.core.paste_blocks(d.blocks);
-        } else if let Some(b) = html.filter(|b| !b.is_empty() && !restates(b) && !(image.is_some() && b.iter().all(|b| matches!(b.kind, BlockKind::Image { .. })))) {
+        } else if let Some(b) = html.filter(|b| {
+            !b.is_empty()
+                && !restates(b)
+                && !(image.is_some() && b.iter().all(|b| matches!(b.kind, BlockKind::Image { .. })))
+        }) {
             self.core.paste_blocks(b);
         } else if let Some(images) = image.filter(|_| rich_target) {
             let mut blocks = Vec::new();
             for img in images {
-                match super::image::clipboard_image_data(img).and_then(|(bytes, ext)| super::image::image_block_from(&bytes, ext)) {
+                match super::image::clipboard_image_data(img)
+                    .and_then(|(bytes, ext)| super::image::image_block_from(&bytes, ext))
+                {
                     Ok(b) => blocks.push(b),
                     Err(msg) => self.toast(msg, cx),
                 }
@@ -2059,13 +3293,23 @@ impl Editor {
         }
     }
 
-    fn on_insert_reminder(&mut self, _: &k::InsertReminder, window: &mut Window, cx: &mut Context<Self>) {
+    fn on_insert_reminder(
+        &mut self,
+        _: &k::InsertReminder,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if self.guard(window, cx) {
             self.insert_new_reminder(window, cx);
         }
     }
 
-    fn on_apply_last_color(&mut self, _: &k::ApplyLastColor, window: &mut Window, cx: &mut Context<Self>) {
+    fn on_apply_last_color(
+        &mut self,
+        _: &k::ApplyLastColor,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if self.guard(window, cx) {
             let (t, b) = self.last_color.clone();
             self.apply_color(Some(t), Some(b), window, cx);
@@ -2124,7 +3368,12 @@ impl Editor {
         self.turn_key(BlockKind::Quote, w, cx)
     }
 
-    fn on_insert_divider(&mut self, _: &k::InsertDivider, window: &mut Window, cx: &mut Context<Self>) {
+    fn on_insert_divider(
+        &mut self,
+        _: &k::InsertDivider,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if self.guard(window, cx) {
             self.core.clear_block_sel();
             self.run_slash(SlashKind::Divider, window, cx);
@@ -2158,34 +3407,61 @@ impl Editor {
 
     fn move_block_by(&mut self, down: bool, window: &mut Window, cx: &mut Context<Self>) {
         let ids = self.core.selected_blocks();
-        let (Some(first), Some(last)) = (ids.first().copied(), ids.last().copied()) else { return };
+        let (Some(first), Some(last)) = (ids.first().copied(), ids.last().copied()) else {
+            return;
+        };
         // Swap with the sibling before / after the selected range.
-        let Some(path) = core::find_path(&self.core.doc.blocks, if down { last } else { first }) else { return };
+        let Some(path) = core::find_path(&self.core.doc.blocks, if down { last } else { first })
+        else {
+            return;
+        };
         let siblings: Vec<BlockId> = match core::parent_path(&path) {
             None => self.core.doc.blocks.iter().map(|b| b.id).collect(),
             Some(pp) => match core::block_at(&self.core.doc.blocks, pp) {
                 Some(p) => match (&p.kind, path.last()) {
-                    (BlockKind::Table(t), Some(core::Seg::Cell(r, c, _))) => t.rows[*r][*c].blocks.iter().map(|b| b.id).collect(),
+                    (BlockKind::Table(t), Some(core::Seg::Cell(r, c, _))) => {
+                        t.rows[*r][*c].blocks.iter().map(|b| b.id).collect()
+                    }
                     _ => p.children.iter().map(|b| b.id).collect(),
                 },
                 None => return,
             },
         };
-        let Some(i) = siblings.iter().position(|x| *x == if down { last } else { first }) else { return };
-        let other = if down { siblings.get(i + 1).copied() } else { i.checked_sub(1).map(|k| siblings[k]) };
+        let Some(i) = siblings
+            .iter()
+            .position(|x| *x == if down { last } else { first })
+        else {
+            return;
+        };
+        let other = if down {
+            siblings.get(i + 1).copied()
+        } else {
+            i.checked_sub(1).map(|k| siblings[k])
+        };
         if let Some(o) = other {
-            self.core.move_block(o, if down { first } else { last }, !down);
+            self.core
+                .move_block(o, if down { first } else { last }, !down);
         }
         self.changed(window, cx);
     }
 
-    fn on_move_block_up(&mut self, _: &k::MoveBlockUp, window: &mut Window, cx: &mut Context<Self>) {
+    fn on_move_block_up(
+        &mut self,
+        _: &k::MoveBlockUp,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if self.guard(window, cx) {
             self.move_block_by(false, window, cx);
         }
     }
 
-    fn on_move_block_down(&mut self, _: &k::MoveBlockDown, window: &mut Window, cx: &mut Context<Self>) {
+    fn on_move_block_down(
+        &mut self,
+        _: &k::MoveBlockDown,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if self.guard(window, cx) {
             self.move_block_by(true, window, cx);
         }
@@ -2193,37 +3469,79 @@ impl Editor {
 
     /// Attach every editor action to the root element.
     pub fn register_actions(&self, d: Div, cx: &mut Context<Self>) -> Div {
-        d.on_action(guard(cx, Self::on_move_left))
-            .on_action(guard(cx, Self::on_move_right))
-            .on_action(guard(cx, Self::on_move_up))
-            .on_action(guard(cx, Self::on_move_down))
+        d.on_action(motion_guard(cx, Self::on_move_left))
+            .on_action(motion_guard(cx, Self::on_move_right))
+            .on_action(motion_guard(cx, Self::on_move_up))
+            .on_action(motion_guard(cx, Self::on_move_down))
             .on_action(guard(cx, Self::on_select_left))
             .on_action(guard(cx, Self::on_select_right))
             .on_action(guard(cx, Self::on_select_up))
             .on_action(guard(cx, Self::on_select_down))
-            .on_action(guard(cx, Self::on_word_left))
-            .on_action(guard(cx, Self::on_word_right))
+            .on_action(motion_guard(cx, Self::on_word_left))
+            .on_action(motion_guard(cx, Self::on_word_right))
             .on_action(guard(cx, Self::on_select_word_left))
             .on_action(guard(cx, Self::on_select_word_right))
-            .on_action(guard(cx, Self::on_line_start))
-            .on_action(guard(cx, Self::on_line_end))
+            .on_action(motion_guard(cx, Self::on_line_start))
+            .on_action(motion_guard(cx, Self::on_line_end))
             .on_action(guard(cx, Self::on_select_line_start))
             .on_action(guard(cx, Self::on_select_line_end))
-            .on_action(guard(cx, Self::on_doc_start))
-            .on_action(guard(cx, Self::on_doc_end))
+            .on_action(motion_guard(cx, Self::on_doc_start))
+            .on_action(motion_guard(cx, Self::on_doc_end))
             .on_action(guard(cx, Self::on_select_to_doc_start))
             .on_action(guard(cx, Self::on_select_to_doc_end))
-            .on_action(guard(cx, Self::on_backspace))
-            .on_action(guard(cx, Self::on_delete))
-            .on_action(guard(cx, Self::on_delete_word_back))
-            .on_action(guard(cx, Self::on_delete_word_forward))
-            .on_action(guard(cx, Self::on_delete_to_line_start))
-            .on_action(guard(cx, Self::on_enter))
-            .on_action(guard(cx, Self::on_soft_break))
-            .on_action(guard(cx, Self::on_toggle_todo))
-            .on_action(guard(cx, Self::on_tab))
-            .on_action(guard(cx, Self::on_shift_tab))
+            .on_action(edit_guard(cx, Self::on_backspace))
+            .on_action(edit_guard(cx, Self::on_delete))
+            .on_action(edit_guard(cx, Self::on_delete_word_back))
+            .on_action(edit_guard(cx, Self::on_delete_word_forward))
+            .on_action(edit_guard(cx, Self::on_delete_to_line_start))
+            .on_action(edit_guard(cx, Self::on_enter))
+            .on_action(edit_guard(cx, Self::on_soft_break))
+            .on_action(edit_guard(cx, Self::on_toggle_todo))
+            .on_action(edit_guard(cx, Self::on_tab))
+            .on_action(edit_guard(cx, Self::on_shift_tab))
             .on_action(guard(cx, Self::on_escape))
+            .on_action(guard(cx, Self::on_insert_here))
+            .on_action(guard(cx, Self::on_insert_after))
+            .on_action(guard(cx, Self::on_insert_line_start))
+            .on_action(guard(cx, Self::on_insert_line_end))
+            .on_action(guard(cx, Self::on_open_below))
+            .on_action(guard(cx, Self::on_open_above))
+            .on_action(guard(cx, Self::on_vim_delete_char))
+            .on_action(op_guard(cx, Self::on_vim_op_delete))
+            .on_action(op_guard(cx, Self::on_vim_op_change))
+            .on_action(op_guard(cx, Self::on_vim_op_yank))
+            .on_action(op_guard(cx, Self::on_vim_textobj_inner))
+            .on_action(op_guard(cx, Self::on_vim_textobj_around))
+            .on_action(textobj_guard(cx, Self::on_vim_obj_word))
+            .on_action(textobj_guard(cx, Self::on_vim_obj_para))
+            .on_action(textobj_guard(cx, Self::on_vim_obj_quote_d))
+            .on_action(textobj_guard(cx, Self::on_vim_obj_quote_s))
+            .on_action(textobj_guard(cx, Self::on_vim_obj_quote_bt))
+            .on_action(textobj_guard(cx, Self::on_vim_obj_paren))
+            .on_action(textobj_guard(cx, Self::on_vim_obj_brace))
+            .on_action(textobj_guard(cx, Self::on_vim_obj_bracket))
+            .on_action(textobj_guard(cx, Self::on_vim_obj_angle))
+            .on_action(guard(cx, Self::on_vim_search_open))
+            .on_action(guard(cx, Self::on_vim_search_open_back))
+            .on_action(guard(cx, Self::on_vim_search_next))
+            .on_action(guard(cx, Self::on_vim_search_prev))
+            .on_action(guard(cx, Self::on_vim_search_word_fwd))
+            .on_action(guard(cx, Self::on_vim_search_word_back))
+            .on_action(guard(cx, Self::on_vim_paste))
+            .on_action(guard(cx, Self::on_vim_visual))
+            .on_action(guard(cx, Self::on_vim_visual_line))
+            .on_action(guard(cx, Self::on_vim_visual_block))
+            .on_action(guard(cx, Self::on_vim_visual_delete))
+            .on_action(guard(cx, Self::on_vim_visual_yank))
+            .on_action(guard(cx, Self::on_vim_visual_block_delete))
+            .on_action(guard(cx, Self::on_vim_visual_block_yank))
+            .on_action(guard(cx, Self::on_vim_block_down))
+            .on_action(guard(cx, Self::on_vim_block_up))
+            .on_action(guard(cx, Self::on_vim_replace))
+            .on_action(guard(cx, Self::on_vim_mark_set))
+            .on_action(guard(cx, Self::on_vim_mark_jump_exact))
+            .on_action(guard(cx, Self::on_vim_mark_jump_line))
+            .on_action(guard(cx, Self::on_vim_command))
             .on_action(guard(cx, Self::on_select_all))
             .on_action(guard(cx, Self::on_copy))
             .on_action(guard(cx, Self::on_copy_markdown))
@@ -2273,13 +3591,22 @@ impl Editor {
         let us = self.core.units();
         let atomic = {
             let bb = self.block_bounds.borrow();
-            us.iter().filter(|u| !u.text).find(|u| bb.get(&u.id).is_some_and(|b| b.contains(&p))).map(|u| u.id)
+            us.iter()
+                .filter(|u| !u.text)
+                .find(|u| bb.get(&u.id).is_some_and(|b| b.contains(&p)))
+                .map(|u| u.id)
         };
         if let Some(id) = atomic {
             return Some((Pos::new(id, 0), false));
         }
         // A pinned header row covers the rows scrolled under it.
-        let pinned = self.tables.stuck.borrow().iter().find(|(_, b)| b.contains(&p)).map(|(t, _)| *t);
+        let pinned = self
+            .tables
+            .stuck
+            .borrow()
+            .iter()
+            .find(|(_, b)| b.contains(&p))
+            .map(|(t, _)| *t);
         let ids: Vec<BlockId> = match pinned.and_then(|t| self.core.table(t)) {
             Some(t) => super::table::first_row_text(t),
             None => us.iter().filter(|u| u.text).map(|u| u.id).collect(),
@@ -2288,17 +3615,40 @@ impl Editor {
         // In a tall row, the nearest text can belong to a different cell.
         // Resolve the clicked grid slot first so a click starts in that cell.
         if let Some((table, _, _)) = self.core.cell_of(pos.block)
-            && let Some((r, c)) = self.slot_at(table, if pinned == Some(table) {
-                self.tables.geo.borrow().get(&(table, false, 0)).map(|b| point(p.x, b.center().y)).unwrap_or(p)
-            } else { p }, false)
+            && let Some((r, c)) = self.slot_at(
+                table,
+                if pinned == Some(table) {
+                    self.tables
+                        .geo
+                        .borrow()
+                        .get(&(table, false, 0))
+                        .map(|b| point(p.x, b.center().y))
+                        .unwrap_or(p)
+                } else {
+                    p
+                },
+                false,
+            )
             && let Some(t) = self.core.table(table)
         {
             let (r, c) = t.origin(if pinned == Some(table) { 0 } else { r }, c);
-            let cell_ids: Vec<_> = ids.iter().copied().filter(|id| self.core.cell_of(*id) == Some((table, r, c))).collect();
+            let cell_ids: Vec<_> = ids
+                .iter()
+                .copied()
+                .filter(|id| self.core.cell_of(*id) == Some((table, r, c)))
+                .collect();
             if let Some((cell_pos, cell_row_end)) = hit_test(&self.cache, p, &cell_ids) {
-                let last = cell_ids.iter().rev().find(|id| self.cache.borrow().contains_key(id)).copied();
+                let last = cell_ids
+                    .iter()
+                    .rev()
+                    .find(|id| self.cache.borrow().contains_key(id))
+                    .copied();
                 (pos, at_row_end) = if let Some(id) = last
-                    && self.cache.borrow().get(&id).is_some_and(|l| p.y > l.bounds.bottom())
+                    && self
+                        .cache
+                        .borrow()
+                        .get(&id)
+                        .is_some_and(|l| p.y > l.bounds.bottom())
                 {
                     (Pos::new(id, self.core.len_of(id)), false)
                 } else {
@@ -2306,10 +3656,18 @@ impl Editor {
                 };
             }
         }
-        Some((Pos::new(pos.block, pos.offset.min(self.core.len_of(pos.block))), at_row_end))
+        Some((
+            Pos::new(pos.block, pos.offset.min(self.core.len_of(pos.block))),
+            at_row_end,
+        ))
     }
 
-    pub fn on_mouse_down(&mut self, ev: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+    pub fn on_mouse_down(
+        &mut self,
+        ev: &MouseDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         window.focus(&self.focus);
         self.reminder_blur(window, cx);
         self.menu = None;
@@ -2334,8 +3692,14 @@ impl Editor {
             self.core.clear_block_sel();
             return cx.notify();
         }
-        let Some((pos, at_row_end)) = self.pos_at(ev.position) else { return };
-        let eq = self.cache.borrow().get(&pos.block).and_then(|l| l.equation_at(ev.position));
+        let Some((pos, at_row_end)) = self.pos_at(ev.position) else {
+            return;
+        };
+        let eq = self
+            .cache
+            .borrow()
+            .get(&pos.block)
+            .and_then(|l| l.equation_at(ev.position));
         if let Some(ix) = eq
             && !ev.modifiers.shift
             && !self.read_only
@@ -2350,7 +3714,11 @@ impl Editor {
         }
         self.core.clear_block_sel();
         self.goal_x = None;
-        let text = self.core.text_of(pos.block).map(|t| t.text.clone()).unwrap_or_default();
+        let text = self
+            .core
+            .text_of(pos.block)
+            .map(|t| t.text.clone())
+            .unwrap_or_default();
         if ev.modifiers.shift {
             self.set_caret(pos, true);
             self.cell_drag_to(ev.position, cx);
@@ -2389,7 +3757,9 @@ impl Editor {
     /// the page like a block drag does, 600px/s, and the selection follows
     /// (#132). Runs every frame; the pointer may not move meanwhile.
     pub(super) fn text_autoscroll(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(at) = self.drag_at.filter(|_| self.dragging) else { return };
+        let Some(at) = self.drag_at.filter(|_| self.dragging) else {
+            return;
+        };
         // Switching away mid-drag stops the page (as a block drag does).
         let active = window.is_window_active();
         if *self.drag_active.get_or_insert(active) && !active {
@@ -2397,7 +3767,13 @@ impl Editor {
             return;
         }
         let v = self.list.viewport_bounds();
-        let dir = if at.y < v.top() + px(20.) { -1. } else if at.y > v.bottom() - px(20.) { 1. } else { 0. };
+        let dir = if at.y < v.top() + px(20.) {
+            -1.
+        } else if at.y > v.bottom() - px(20.) {
+            1.
+        } else {
+            0.
+        };
         if dir == 0. {
             self.drag_scrolled = None;
             return;
@@ -2405,7 +3781,9 @@ impl Editor {
         // Last frame's layout already shows the rows scrolled in: extend to them.
         self.drag_to(at, cx);
         let now = std::time::Instant::now();
-        let dt = self.drag_scrolled.map_or(0., |t| (now - t).as_secs_f32().min(0.05));
+        let dt = self
+            .drag_scrolled
+            .map_or(0., |t| (now - t).as_secs_f32().min(0.05));
         self.drag_scrolled = Some(now);
         self.list.scroll_by(px(dir * 600. * dt));
         window.request_animation_frame();
@@ -2429,7 +3807,12 @@ impl Editor {
         }
     }
 
-    pub fn on_hover_move(&mut self, ev: &MouseMoveEvent, window: &mut Window, cx: &mut Context<Self>) {
+    pub fn on_hover_move(
+        &mut self,
+        ev: &MouseMoveEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if self.resizing_image() {
             return match ev.pressed_button {
                 Some(MouseButton::Left) => self.resize_to(ev.position.x, cx),
@@ -2443,10 +3826,20 @@ impl Editor {
             };
         }
         if self.block_drag.is_some() {
-            return self.block_drag_move(ev.position, ev.pressed_button == Some(MouseButton::Left), window, cx);
+            return self.block_drag_move(
+                ev.position,
+                ev.pressed_button == Some(MouseButton::Left),
+                window,
+                cx,
+            );
         }
         if self.tables.drag.is_some() {
-            return self.table_drag_move(ev.position, ev.pressed_button == Some(MouseButton::Left), window, cx);
+            return self.table_drag_move(
+                ev.position,
+                ev.pressed_button == Some(MouseButton::Left),
+                window,
+                cx,
+            );
         }
         if self.col_drag.is_some() {
             match ev.pressed_button {
@@ -2478,7 +3871,9 @@ impl Editor {
             self.link_hover(Some(p), cx);
             self.button_hover(Some(p), cx);
         }
-        if ev.pressed_button.is_some() || matches!(self.menu, Some(Menu::Block { .. }) | Some(Menu::Add { .. })) {
+        if ev.pressed_button.is_some()
+            || matches!(self.menu, Some(Menu::Block { .. }) | Some(Menu::Add { .. }))
+        {
             return;
         }
         let best = {
@@ -2486,7 +3881,8 @@ impl Editor {
             let mut best: Option<(f32, BlockId)> = None;
             for id in &self.handle_targets {
                 let Some(b) = bb.get(id) else { continue };
-                let ext = Bounds::from_corners(point(b.left() - px(60.), b.top()), b.bottom_right());
+                let ext =
+                    Bounds::from_corners(point(b.left() - px(60.), b.top()), b.bottom_right());
                 if ext.contains(&p) {
                     let area = f32::from(b.size.width) * f32::from(b.size.height);
                     if best.is_none_or(|(a, _)| area < a) {
@@ -2503,7 +3899,12 @@ impl Editor {
     }
 
     /// Click in the empty area below the content: focus a trailing empty paragraph.
-    pub fn on_click_below(&mut self, _: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+    pub fn on_click_below(
+        &mut self,
+        _: &MouseDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         window.focus(&self.focus);
         if self.read_only {
             return;
@@ -2518,7 +3919,13 @@ impl Editor {
     }
 
     /// Handle (⋮⋮) click: select the block and open its menu; "+" opens the add panel.
-    pub fn open_block_menu(&mut self, block: BlockId, add: bool, window: &mut Window, cx: &mut Context<Self>) {
+    pub fn open_block_menu(
+        &mut self,
+        block: BlockId,
+        add: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         window.focus(&self.focus);
         self.slash = None;
         self.menu_hovered = false;
@@ -2526,7 +3933,10 @@ impl Editor {
             self.core.clear_block_sel();
             self.core.sel = Selection::caret(Pos::new(block, 0));
             // No autoSelect: nothing is highlighted until hover or ↑↓.
-            self.menu = Some(Menu::Add { block, selected: usize::MAX });
+            self.menu = Some(Menu::Add {
+                block,
+                selected: usize::MAX,
+            });
             self.size_pick = (0, 0);
             self.slash_scroll.set_offset(Point::default());
         } else {
@@ -2536,7 +3946,13 @@ impl Editor {
         cx.notify();
     }
 
-    pub fn block_menu_action(&mut self, block: BlockId, act: BlockAct, window: &mut Window, cx: &mut Context<Self>) {
+    pub fn block_menu_action(
+        &mut self,
+        block: BlockId,
+        act: BlockAct,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         // The 标题行 / 标题列 switches flip in place; the menu stays open.
         if !matches!(act, BlockAct::HeaderRow | BlockAct::HeaderCol) {
             self.menu = None;
@@ -2577,7 +3993,9 @@ impl Editor {
                     .filter(|b| matches!(b.kind, BlockKind::Callout { .. }))
                     .map(|b| b.children.iter().map(|c| c.id).collect());
                 match children {
-                    Some(ids) if matches!(kind, BlockKind::Callout { .. }) => self.core.unwrap_container(&ids),
+                    Some(ids) if matches!(kind, BlockKind::Callout { .. }) => {
+                        self.core.unwrap_container(&ids)
+                    }
                     Some(ids) => self.core.turn_into(&ids, kind),
                     None => self.core.turn_into(&[block], kind),
                 }
@@ -2619,7 +4037,9 @@ impl Editor {
         }
         self.core.insert_text(&s);
         if s == " " {
-            let _ = self.core.markdown_block_shortcut() || self.core.markdown_divider() || self.core.autolink();
+            let _ = self.core.markdown_block_shortcut()
+                || self.core.markdown_divider()
+                || self.core.autolink();
         } else if s == "-" {
             self.core.markdown_divider();
         }
@@ -2638,7 +4058,9 @@ impl Editor {
         if self.core.in_block_mode() {
             return None;
         }
-        self.core.text_of(self.core.sel.head.block).map(|t| t.text.clone())
+        self.core
+            .text_of(self.core.sel.head.block)
+            .map(|t| t.text.clone())
     }
 
     /// Selection reported to the platform: within the head block only.
@@ -2704,10 +4126,18 @@ impl EntityInputHandler for Editor {
         Some(t[r].to_string())
     }
 
-    fn selected_text_range(&mut self, _: bool, _: &mut Window, _: &mut Context<Self>) -> Option<UTF16Selection> {
+    fn selected_text_range(
+        &mut self,
+        _: bool,
+        _: &mut Window,
+        _: &mut Context<Self>,
+    ) -> Option<UTF16Selection> {
         let t = self.head_text()?;
         let (r, reversed) = self.reported_range(&t);
-        Some(UTF16Selection { range: to16(&t, r.start)..to16(&t, r.end), reversed })
+        Some(UTF16Selection {
+            range: to16(&t, r.start)..to16(&t, r.end),
+            reversed,
+        })
     }
 
     fn marked_text_range(&self, _: &mut Window, _: &mut Context<Self>) -> Option<Range<usize>> {
@@ -2723,21 +4153,69 @@ impl EntityInputHandler for Editor {
         self.marked = None;
     }
 
-    fn replace_text_in_range(&mut self, range: Option<Range<usize>>, text: &str, window: &mut Window, cx: &mut Context<Self>) {
+    fn replace_text_in_range(
+        &mut self,
+        range: Option<Range<usize>>,
+        text: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         self.pointer_hidden = true;
-        if self.core.in_block_mode() {
+        // Vim `r`: the armed keystroke replaces the char under the caret.
+        if self.vim_replace_pending {
+            self.vim_replace_pending = false;
+            if !text.is_empty() && !self.core.in_block_mode() {
+                self.core.replace_char(text);
+                self.changed(window, cx);
+            } else {
+                cx.notify();
+            }
+            return;
+        }
+        // Vim `m`/`` ` ``/`'`: the armed keystroke names the mark.
+        if let Some(op) = self.vim_mark_pending.take() {
+            if let Some(c) = text.chars().next().filter(|c| c.is_ascii_alphabetic()) {
+                match op {
+                    VimMarkOp::Set => {
+                        self.vim_marks.insert(c, self.core.sel.head);
+                    }
+                    VimMarkOp::JumpExact | VimMarkOp::JumpLineStart => match self.vim_marks.get(&c) {
+                        Some(&pos) if self.core.block(pos.block).is_some() => {
+                            let p = if op == VimMarkOp::JumpLineStart { Pos::new(pos.block, 0) } else { pos };
+                            self.core.sel = Selection::caret(p);
+                            // Text at the mark may have shrunk since it was set.
+                            self.core.fix_selection();
+                        }
+                        // The block was deleted since the mark was set — drop it.
+                        _ => {
+                            self.vim_marks.remove(&c);
+                        }
+                    },
+                }
+            }
+            self.changed(window, cx);
+            return;
+        }
+        // Vim Normal/Visual: keystrokes are commands, not text.
+        if self.core.in_block_mode() || self.vim_blocks_input() {
             return;
         }
         let head = self.core.sel.head.block;
         if let Some((b, r)) = self.marked.take() {
-            self.core.sel = Selection { anchor: Pos::new(b, r.start), head: Pos::new(b, r.end) };
+            self.core.sel = Selection {
+                anchor: Pos::new(b, r.start),
+                head: Pos::new(b, r.end),
+            };
         } else if let Some(r16) = range
             && let Some(t) = self.head_text()
         {
             let (rep, _) = self.reported_range(&t);
             let r = from16(&t, r16.start)..from16(&t, r16.end);
             if r != rep {
-                self.core.sel = Selection { anchor: Pos::new(head, r.start), head: Pos::new(head, r.end) };
+                self.core.sel = Selection {
+                    anchor: Pos::new(head, r.start),
+                    head: Pos::new(head, r.end),
+                };
             }
         }
         self.type_text(text, window, cx);
@@ -2752,10 +4230,12 @@ impl EntityInputHandler for Editor {
         cx: &mut Context<Self>,
     ) {
         self.pointer_hidden = true;
-        if self.core.in_block_mode() {
+        if self.core.in_block_mode() || self.vim_blocks_input() {
             return;
         }
-        if self.core.text_of(self.core.sel.head.block).is_none() || self.core.sel.head.block != self.core.sel.anchor.block {
+        if self.core.text_of(self.core.sel.head.block).is_none()
+            || self.core.sel.head.block != self.core.sel.anchor.block
+        {
             // Atomic caret or a cross-block selection: clear it first.
             if !self.core.sel.is_collapsed() {
                 self.core.delete_selection();
@@ -2765,7 +4245,11 @@ impl EntityInputHandler for Editor {
             }
         }
         let head = self.core.sel.head.block;
-        let t = self.core.text_of(head).map(|t| t.text.clone()).unwrap_or_default();
+        let t = self
+            .core
+            .text_of(head)
+            .map(|t| t.text.clone())
+            .unwrap_or_default();
         let r = match (&self.marked, range) {
             (Some((b, r)), _) if *b == head => r.clone(),
             (_, Some(r16)) => from16(&t, r16.start)..from16(&t, r16.end),
@@ -2774,24 +4258,41 @@ impl EntityInputHandler for Editor {
         self.core.replace_in_block(head, r.clone(), text);
         self.marked = (!text.is_empty()).then(|| (head, r.start..r.start + text.len()));
         if let Some(ns) = new_sel {
-            let t2 = self.core.text_of(head).map(|t| t.text.clone()).unwrap_or_default();
+            let t2 = self
+                .core
+                .text_of(head)
+                .map(|t| t.text.clone())
+                .unwrap_or_default();
             let base = to16(&t2, r.start);
             let a = from16(&t2, base + ns.start);
             let b = from16(&t2, base + ns.end);
-            self.core.sel = Selection { anchor: Pos::new(head, a), head: Pos::new(head, b) };
+            self.core.sel = Selection {
+                anchor: Pos::new(head, a),
+                head: Pos::new(head, b),
+            };
         }
         self.slash = None;
         self.toolbar_hidden = true;
         self.changed(window, cx);
     }
 
-    fn bounds_for_range(&mut self, range: Range<usize>, _: Bounds<Pixels>, _: &mut Window, _: &mut Context<Self>) -> Option<Bounds<Pixels>> {
+    fn bounds_for_range(
+        &mut self,
+        range: Range<usize>,
+        _: Bounds<Pixels>,
+        _: &mut Window,
+        _: &mut Context<Self>,
+    ) -> Option<Bounds<Pixels>> {
         let head = self.core.sel.head.block;
         let t = self.core.text_of(head)?.text.clone();
         let cache = self.cache.borrow();
         let l = cache.get(&head)?;
         let at = |ix: usize| {
-            if self.caret_row_end == Some((head, ix)) { l.position_at_row_end(ix) } else { l.position_for(ix) }
+            if self.caret_row_end == Some((head, ix)) {
+                l.position_at_row_end(ix)
+            } else {
+                l.position_for(ix)
+            }
         };
         let a = at(from16(&t, range.start));
         let b = at(from16(&t, range.end));
@@ -2799,7 +4300,12 @@ impl EntityInputHandler for Editor {
         Some(r)
     }
 
-    fn character_index_for_point(&mut self, p: Point<Pixels>, _: &mut Window, _: &mut Context<Self>) -> Option<usize> {
+    fn character_index_for_point(
+        &mut self,
+        p: Point<Pixels>,
+        _: &mut Window,
+        _: &mut Context<Self>,
+    ) -> Option<usize> {
         let head = self.core.sel.head.block;
         let t = self.core.text_of(head)?.text.clone();
         let cache = self.cache.borrow();
@@ -2815,6 +4321,10 @@ fn guard<A: Action, F: Fn(&mut Editor, &A, &mut Window, &mut Context<Editor>) + 
     f: F,
 ) -> impl Fn(&A, &mut Window, &mut App) + 'static {
     cx.listener(move |e, a: &A, w, cx| {
+        // Any non-motion, non-operator action cancels a pending Vim operator
+        // (and the `i`/`a` text-object wait it may have armed).
+        e.vim_pending_op = None;
+        e.vim_textobj_pending = None;
         if e.cd.dialog.is_none() {
             f(e, a, w, cx)
         } else {
@@ -2823,4 +4333,84 @@ fn guard<A: Action, F: Fn(&mut Editor, &A, &mut Window, &mut Context<Editor>) + 
     })
 }
 
-impl Editor { pub(crate) fn refresh_theme(&mut self) { self.items_key = None; self.menu = None; } }
+/// Like `guard`, but keeps a pending Vim operator alive and *applies* it once
+/// the wrapped motion has moved the caret (so `dw`/`y$`/… delete/yank the span
+/// from where the operator was armed to the motion's landing point).
+fn motion_guard<A: Action, F: Fn(&mut Editor, &A, &mut Window, &mut Context<Editor>) + 'static>(
+    cx: &mut Context<Editor>,
+    f: F,
+) -> impl Fn(&A, &mut Window, &mut App) + 'static {
+    cx.listener(move |e, a: &A, w, cx| {
+        if e.cd.dialog.is_some() {
+            return cx.propagate();
+        }
+        // A plain motion (not an object key) ends any text-object wait.
+        e.vim_textobj_pending = None;
+        match e.vim_pending_op.take() {
+            Some((op, anchor)) => {
+                f(e, a, w, cx);
+                e.apply_vim_op(op, anchor, w, cx);
+            }
+            None => f(e, a, w, cx),
+        }
+    })
+}
+
+/// Like `guard`, but does **not** cancel a pending operator — used for the
+/// operator keys themselves so `dd`/`yy`/`cc` (operator pressed twice) work.
+/// Still ends a text-object wait: `d` right after `di` is not a valid object.
+fn op_guard<A: Action, F: Fn(&mut Editor, &A, &mut Window, &mut Context<Editor>) + 'static>(
+    cx: &mut Context<Editor>,
+    f: F,
+) -> impl Fn(&A, &mut Window, &mut App) + 'static {
+    cx.listener(move |e, a: &A, w, cx| {
+        e.vim_textobj_pending = None;
+        if e.cd.dialog.is_none() {
+            f(e, a, w, cx)
+        } else {
+            cx.propagate()
+        }
+    })
+}
+
+/// For the text-object key itself (`w`, `"`, `(`, …): touches neither pending
+/// state, since the handler needs to read `vim_textobj_pending` (the `around`
+/// flag) before deciding how to clear it.
+fn textobj_guard<A: Action, F: Fn(&mut Editor, &A, &mut Window, &mut Context<Editor>) + 'static>(
+    cx: &mut Context<Editor>,
+    f: F,
+) -> impl Fn(&A, &mut Window, &mut App) + 'static {
+    cx.listener(move |e, a: &A, w, cx| {
+        if e.cd.dialog.is_none() {
+            f(e, a, w, cx)
+        } else {
+            cx.propagate()
+        }
+    })
+}
+
+/// Like `guard`, but swallows the action in Vim Normal/Visual mode — editing
+/// keys (Backspace, Enter, Tab…) must not mutate the document there. Wrapping
+/// at the action boundary catches every keystroke that routes to the handler.
+fn edit_guard<A: Action, F: Fn(&mut Editor, &A, &mut Window, &mut Context<Editor>) + 'static>(
+    cx: &mut Context<Editor>,
+    f: F,
+) -> impl Fn(&A, &mut Window, &mut App) + 'static {
+    cx.listener(move |e, a: &A, w, cx| {
+        e.vim_pending_op = None;
+        e.vim_textobj_pending = None;
+        if e.cd.dialog.is_some() {
+            cx.propagate()
+        } else if !e.vim_blocks_input() {
+            f(e, a, w, cx)
+        }
+        // else: Vim Normal/Visual swallows editing keys (motions stay bound).
+    })
+}
+
+impl Editor {
+    pub(crate) fn refresh_theme(&mut self) {
+        self.items_key = None;
+        self.menu = None;
+    }
+}

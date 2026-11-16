@@ -17,6 +17,7 @@ use std::sync::{Arc, LazyLock, Mutex, RwLock};
 static FEISHU: AtomicBool = AtomicBool::new(false);
 static LANG: AtomicU8 = AtomicU8::new(Lang::En as u8);
 static MOTION_HIGH: AtomicBool = AtomicBool::new(false);
+static VIM: AtomicBool = AtomicBool::new(false);
 static PREFS: RwLock<Option<Preferences>> = RwLock::new(None);
 
 /// The active document theme draws blocks the 飞书 way (else Craft's).
@@ -40,6 +41,8 @@ pub fn lang() -> Lang { Lang::ALL.get(LANG.load(Ordering::Relaxed) as usize).cop
 pub fn english() -> bool { lang() != Lang::Zh }
 /// 外观 › 动画 is 丰富: folding, the selection and hover animate too (else they answer at once).
 pub fn motion_high() -> bool { MOTION_HIGH.load(Ordering::Relaxed) }
+/// Vim mode: modal editing (Normal/Insert/Visual) and a block caret in Normal.
+pub fn vim() -> bool { VIM.load(Ordering::Relaxed) }
 pub fn tr(zh: &'static str, en: &'static str) -> &'static str { match lang() { Lang::Zh => zh, Lang::En => en, l => crate::l10n::get(l, zh).unwrap_or(en) } }
 /// `localized_format!` for a given language: `zh` / `en` build the two
 /// originals; other languages refill their translation of `template`.
@@ -121,6 +124,8 @@ pub struct Preferences {
     pub ui_font: String,
     /// When 稍后 put off moving the library to real folders (Unix seconds; 0 never).
     pub migrate_later: u64,
+    /// Vim mode: modal editing is on.
+    pub vim: bool,
 }
 
 /// A week between asks to move the library to real folders.
@@ -148,7 +153,7 @@ fn system_lang() -> Lang {
 impl Default for Preferences {
     fn default() -> Self {
         let lang = system_lang();
-        Preferences { theme: String::new(), feishu: true, english: lang != Lang::Zh, language: lang.code().into(), remote_images: true, quick_hotkey: true, auto_update: true, appearance: String::new(), seen_version: String::new(), motion: String::new(), new_default: String::new(), last_new: String::new(), search_engine: String::new(), browser: String::new(), opaque_window: false, ui_font: String::new(), migrate_later: 0 }
+        Preferences { theme: String::new(), feishu: true, english: lang != Lang::Zh, language: lang.code().into(), remote_images: true, quick_hotkey: true, auto_update: true, appearance: String::new(), seen_version: String::new(), motion: String::new(), new_default: String::new(), last_new: String::new(), search_engine: String::new(), browser: String::new(), opaque_window: false, ui_font: String::new(), migrate_later: 0, vim: false }
     }
 }
 
@@ -183,6 +188,7 @@ fn apply(p: Preferences) {
     FEISHU.store(p.feishu, Ordering::Relaxed);
     LANG.store(p.lang() as u8, Ordering::Relaxed);
     MOTION_HIGH.store(p.motion == "high", Ordering::Relaxed);
+    VIM.store(p.vim, Ordering::Relaxed);
     // Before the themes are read (startup) the base comes from `feishu`.
     themes::select(&p.theme_id());
     *PREFS.write().unwrap() = Some(p);
@@ -288,13 +294,14 @@ pub(crate) fn watch_themes(cx: &mut Context<Workspace>) {
 // ---- the view
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum Page { #[default] General, Appearance, Shortcuts, Library, About }
+pub enum Page { #[default] General, Appearance, Editor, Shortcuts, Library, About }
 
 impl Page {
     fn title(self) -> &'static str {
         match self {
             Page::General => tr("通用", "General"),
             Page::Appearance => tr("外观", "Appearance"),
+            Page::Editor => tr("编辑器", "Editor"),
             Page::Shortcuts => tr("快捷键", "Shortcuts"),
             Page::Library => tr("文档库", "Documents"),
             Page::About => tr("关于", "About"),
@@ -304,6 +311,7 @@ impl Page {
         match self {
             Page::General => "view-settings",
             Page::Appearance => "palette",
+            Page::Editor => "code",
             Page::Shortcuts => "keyboard",
             Page::Library => "storage",
             Page::About => "info",
@@ -311,9 +319,9 @@ impl Page {
     }
 }
 
-/// The sidebar list, one evenly spaced run (six rows need no unlabelled
+/// The sidebar list, one evenly spaced run (seven rows need no unlabelled
 /// groups); `None` is 回收站 (its own view, shown with this sidebar).
-const NAV: [Option<Page>; 6] = [Some(Page::General), Some(Page::Appearance), Some(Page::Shortcuts), Some(Page::Library), None, Some(Page::About)];
+const NAV: [Option<Page>; 7] = [Some(Page::General), Some(Page::Appearance), Some(Page::Editor), Some(Page::Shortcuts), Some(Page::Library), None, Some(Page::About)];
 
 // ---- controls (switch on the accent, 30pt buttons, grouped rows)
 
@@ -814,6 +822,7 @@ impl Workspace {
         let body = match page {
             Page::General => self.general_page(cx),
             Page::Appearance => self.appearance_page(cx),
+            Page::Editor => self.editor_page(cx),
             Page::Shortcuts => self.shortcut_settings(cx),
             Page::Library => self.library_page(cx),
             Page::About => self.about_page(cx),
@@ -949,6 +958,19 @@ impl Workspace {
                 })).collect()))
                 .children(errors.into_iter().chain(warnings.into_iter().take(8).map(|w| format!("{}：{w}", tr("未生效", "Ignored")))).map(|e| div().px(px(4.)).text_size(px(theme::ui_font_small())).line_height(px(theme::ui_font_small() + 6.)).text_color(Theme::danger()).child(e)))
                 )
+            .into_any_element()
+    }
+
+    fn editor_page(&self, cx: &mut Context<Self>) -> AnyElement {
+        div().w_full().flex().flex_col().gap(px(28.))
+            .child(group(None, vec![
+                // Vim mode: modal editing with a block caret in Normal mode.
+                row(tr("Vim mode", "Vim mode"), Some(tr("Edit the nvim way: Normal / Insert / Visual modes, Esc returns to Normal, and a block caret in Normal.", "Edit the nvim way: Normal / Insert / Visual modes, Esc returns to Normal, and a block caret in Normal.").into()),
+                    switch("pref-vim", prefs().vim).on_click(cx.listener(|w, _, window, cx| {
+                        w.set_pref(|p| p.vim = !p.vim, cx);
+                        window.refresh();
+                    }))).into_any_element(),
+            ]))
             .into_any_element()
     }
 

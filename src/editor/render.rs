@@ -239,7 +239,14 @@ impl R<'_> {
         let bm = core.in_block_mode() || self.ghost;
         let sel = core.sel;
         spec.link_underline = !bm && self.focused && sel.head.block == id;
-        let selection = if bm || sel.is_collapsed() { None } else { core.range_in(id, &self.units) };
+        let selection = if self.ed.vim_mode == super::view::VimMode::VisualBlock {
+            // Columnar: the same byte-column range on each covered line.
+            core.col_range_in(id, &self.units)
+        } else if bm || sel.is_collapsed() {
+            None
+        } else {
+            core.range_in(id, &self.units)
+        };
         let caret_here = !bm && core.cell_sel.is_none() && sel.head.block == id && sel.is_collapsed();
         RichTextElement {
             id,
@@ -255,6 +262,7 @@ impl R<'_> {
             marked: self.ed.marked.as_ref().filter(|(b, _)| *b == id && !self.ghost).map(|(_, r)| r.clone()),
             cache: self.cache.clone(),
             show_caret: caret_here && self.focused && self.ed.caret_visible && !self.ed.read_only,
+            block_caret: crate::settings::vim() && self.ed.vim_mode != super::view::VimMode::Insert,
             highlight: None,
             found: if self.ghost { vec![] } else { self.ed.find_hits(id) },
             eq_counter: self.eqnos.get(&id).copied().unwrap_or(0),
@@ -1365,6 +1373,33 @@ impl Editor {
         let origin0 = self.content_origin.get();
         let counter = self.word_counter();
         let find_box = self.find_box(window, cx);
+        // Vim `:` ex command line, docked at the bottom like a terminal's.
+        let vim_cmd_bar = self.vim_cmd_open.then(|| {
+            div().absolute().bottom_0().left_0().right_0()
+                .flex().items_center().gap(px(6.))
+                .px(px(12.)).py(px(6.))
+                .bg(crate::theme::raised(Theme::bg_body())).border_t_1().border_color(Theme::line_border())
+                .text_color(Theme::text())
+                .child(":")
+                .child(div().flex_1().child(self.vim_cmd.clone()))
+        });
+        // Vim `/`/`?` search prompt, same docking as the `:` bar above —
+        // deliberately not the ⌘F popover (`find_box` stands aside while open).
+        let vim_search_bar_el = self.vim_search_bar.then(|| {
+            let n = self.find.as_ref().map_or(0, |f| f.matches.len());
+            let counter = match self.find.as_ref().and_then(|f| f.current) {
+                Some(i) if n > 0 => format!("{} / {n}", i + 1),
+                _ => "0 / 0".to_string(),
+            };
+            div().absolute().bottom_0().left_0().right_0()
+                .flex().items_center().gap(px(6.))
+                .px(px(12.)).py(px(6.))
+                .bg(crate::theme::raised(Theme::bg_body())).border_t_1().border_color(Theme::line_border())
+                .text_color(Theme::text())
+                .child(self.vim_search_prefix.to_string())
+                .child(div().flex_1().child(self.find_field.clone()))
+                .child(div().text_size(px(12.)).text_color(Theme::text_caption()).child(counter))
+        });
         if std::mem::take(&mut self.autoscroll) && self.reveal.is_none() {
             self.reveal = Some((Reveal::Caret, 0));
         }
@@ -1595,8 +1630,32 @@ impl Editor {
         .left_0()
         .size_full();
 
+        // Vim mode layers a `vim = normal|insert|visual` attribute onto the
+        // Editor context so Normal-mode letter bindings (keymap.rs) can match.
+        let ctx = if read_only { "EditorRO".to_string() } else if crate::settings::vim() && !self.vim_awaiting_char() {
+            use super::view::VimMode;
+            // Visual Line shares the charwise Visual key bindings (the motion
+            // and operator handlers branch on the block selection themselves);
+            // Visual Block has its own columnar bindings.
+            let m = match self.vim_mode {
+                VimMode::Normal => "normal",
+                VimMode::Insert => "insert",
+                VimMode::Visual | VimMode::VisualLine => "visual",
+                VimMode::VisualBlock => "visualblock",
+            };
+            let mut ctx = format!("Editor vim = {m}");
+            // Pending `d`/`c`/`y` (and, within that, `i`/`a`) narrow what the
+            // next keystroke means — see the `vn_pending`/`vn_textobj` bindings.
+            if self.vim_pending_op.is_some() {
+                ctx.push_str(" pending");
+            }
+            if self.vim_textobj_pending.is_some() {
+                ctx.push_str(" textobj");
+            }
+            ctx
+        } else { "Editor".to_string() };
         let root = div()
-            .key_context(if read_only { "EditorRO" } else { "Editor" })
+            .key_context(ctx.as_str())
             .when(read_only, |d| {
                 d.on_key_down(cx.listener(|ed, ev: &KeyDownEvent, window, cx| {
                     if ed.focus.is_focused(window) {
@@ -1645,6 +1704,8 @@ impl Editor {
             .children(image_layer)
             .children(counter)
             .children(find_box)
+            .children(vim_cmd_bar)
+            .children(vim_search_bar_el)
             .children(lightbox)
             .children(toast)
             .child(root_canvas)

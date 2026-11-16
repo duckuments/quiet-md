@@ -60,6 +60,16 @@ pub struct Unit {
 
 // ------------------------------------------------------------------ tree access
 
+/// Largest char boundary `<= i` (and `<= s.len()`), so byte columns taken from
+/// one line never split a multi-byte char on another.
+fn floor_boundary(s: &str, i: usize) -> usize {
+    let mut i = i.min(s.len());
+    while i > 0 && !s.is_char_boundary(i) {
+        i -= 1;
+    }
+    i
+}
+
 pub fn find_path(blocks: &[Block], id: BlockId) -> Option<Path> {
     for (i, b) in blocks.iter().enumerate() {
         if b.id == id {
@@ -288,6 +298,103 @@ pub fn prev_word(s: &str, offset: usize) -> usize {
         }
     }
     last
+}
+
+/// Vim text objects (`iw`, `a"`, `ib`, …). All scoped to the current block's
+/// text — a block is this app's paragraph, so there is no cross-block object.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TextObj {
+    /// `iw`/`aw`.
+    Word,
+    /// `ip`/`ap`: the whole block (a block has no interior blank lines to split on).
+    Para,
+    /// `i"`/`a"`, `i'`/`a'`, `` i` ``/`` a` ``.
+    Quote(char),
+    /// `ib`/`i(`/`i)`, `iB`/`i{`/`i}`, `i[`/`i]`, `i<`/`i>`.
+    Bracket(char, char),
+}
+
+/// Word/whitespace run under `offset` (`iw`); `around` extends it to include
+/// one side of adjoining whitespace (`aw`), as nvim does.
+fn word_object(s: &str, offset: usize, around: bool) -> Option<Range<usize>> {
+    let bounds: Vec<(usize, &str)> = s.split_word_bound_indices().collect();
+    let idx = bounds.iter().position(|(i, w)| offset >= *i && offset < *i + w.len())?;
+    let (i0, w0) = bounds[idx];
+    let inner = i0..i0 + w0.len();
+    if !around {
+        return Some(inner);
+    }
+    let is_space = |w: &str| w.trim().is_empty();
+    if let Some((i1, w1)) = bounds.get(idx + 1)
+        && is_space(w1)
+    {
+        return Some(i0..i1 + w1.len());
+    }
+    if idx > 0 {
+        let (ip, wp) = bounds[idx - 1];
+        if is_space(wp) {
+            return Some(ip..inner.end);
+        }
+    }
+    Some(inner)
+}
+
+/// The quote pair (char `q`) enclosing `offset`, or the nearest pair after it
+/// on the line if the caret sits outside any pair (nvim's quote-object rule).
+fn quote_object(s: &str, offset: usize, q: char) -> Option<(usize, usize)> {
+    let bytes = s.as_bytes();
+    let positions: Vec<usize> = s
+        .char_indices()
+        .filter(|&(i, c)| c == q && (i == 0 || bytes[i - 1] != b'\\'))
+        .map(|(i, _)| i)
+        .collect();
+    let mut fallback = None;
+    for &[open, close] in positions.as_chunks::<2>().0 {
+        if open <= offset && offset <= close {
+            return Some((open, close));
+        }
+        if open >= offset && fallback.is_none() {
+            fallback = Some((open, close));
+        }
+    }
+    fallback
+}
+
+/// The innermost `open`/`close` pair enclosing `offset`, by a balanced scan
+/// (supports nesting), or `None` if `offset` is outside any pair.
+fn bracket_object(s: &str, offset: usize, open: char, close: char) -> Option<(usize, usize)> {
+    let mut depth = 0i32;
+    let mut open_pos = None;
+    for (i, c) in s.char_indices().rev() {
+        if i > offset {
+            continue;
+        }
+        if c == close {
+            depth += 1;
+        } else if c == open {
+            if depth == 0 {
+                open_pos = Some(i);
+                break;
+            }
+            depth -= 1;
+        }
+    }
+    let open_pos = open_pos?;
+    let mut depth = 0i32;
+    let mut close_pos = None;
+    for (j, c) in s[open_pos + open.len_utf8()..].char_indices() {
+        let i = j + open_pos + open.len_utf8();
+        if c == open {
+            depth += 1;
+        } else if c == close {
+            if depth == 0 {
+                close_pos = Some(i);
+                break;
+            }
+            depth -= 1;
+        }
+    }
+    Some((open_pos, close_pos?))
 }
 
 pub fn next_word(s: &str, offset: usize) -> usize {
@@ -565,6 +672,134 @@ impl Core {
         let a = if i == si { s.offset } else { 0 };
         let b = if i == ei { e.offset } else { len };
         Some(a..b)
+    }
+
+    /// Vim `r`: replace the grapheme under the caret with `s`, leaving the
+    /// caret on it. No-op at end of line (nothing to replace).
+    pub fn replace_char(&mut self, s: &str) {
+        let p = self.sel.head;
+        let end = match self.text_of(p.block) {
+            Some(t) if p.offset < t.len() => next_grapheme(&t.text, p.offset),
+            _ => return,
+        };
+        self.checkpoint(EditKind::Other);
+        if let Some(t) = self.text_mut(p.block) {
+            t.replace(p.offset..end, &RichText::plain(s));
+        }
+        self.sel = Selection::caret(p);
+    }
+
+    /// Resolve a Vim text object at the caret, in its block's own text.
+    pub fn text_object(&self, obj: TextObj, around: bool) -> Option<Range<usize>> {
+        let p = self.sel.head;
+        let s = &self.text_of(p.block)?.text;
+        match obj {
+            TextObj::Para => Some(0..s.len()),
+            TextObj::Word => word_object(s, p.offset, around),
+            TextObj::Quote(q) => {
+                let (open, close) = quote_object(s, p.offset, q)?;
+                Some(if around { open..close + q.len_utf8() } else { open + q.len_utf8()..close })
+            }
+            TextObj::Bracket(open_ch, close_ch) => {
+                let (open, close) = bracket_object(s, p.offset, open_ch, close_ch)?;
+                Some(if around { open..close + close_ch.len_utf8() } else { open + open_ch.len_utf8()..close })
+            }
+        }
+    }
+
+    /// Visual Block column range within block `id`: the same byte-column span
+    /// `[c0,c1)` on every covered line, clamped to the line and to char
+    /// boundaries. `None` if `id` is outside the rectangle or not text.
+    pub fn col_range_in(&self, id: BlockId, units: &[Unit]) -> Option<Range<usize>> {
+        let (s, e) = self.ordered_in(units);
+        let si = self.unit_index(units, s.block)?;
+        let ei = self.unit_index(units, e.block)?;
+        let i = self.unit_index(units, id)?;
+        if i < si || i > ei || !units[i].text {
+            return None;
+        }
+        let (c0, c1) = (s.offset.min(e.offset), s.offset.max(e.offset));
+        let t = self.text_of(id)?;
+        Some(floor_boundary(&t.text, c0)..floor_boundary(&t.text, c1))
+    }
+
+    /// Delete the Visual Block rectangle: the column range on each covered
+    /// line. Lines shorter than the column are left as-is.
+    pub fn delete_columns(&mut self) {
+        let units = self.units();
+        let (s, e) = self.ordered_in(&units);
+        let (Some(si), Some(ei)) = (self.unit_index(&units, s.block), self.unit_index(&units, e.block)) else { return; };
+        let (c0, c1) = (s.offset.min(e.offset), s.offset.max(e.offset));
+        // Checkpoint only once an actual edit happens, so a zero-width rectangle
+        // (vertical-only selection) leaves no empty undo step and no dirty flag.
+        let mut edited = false;
+        for u in &units[si..=ei] {
+            if !u.text {
+                continue;
+            }
+            let (a, b) = match self.text_of(u.id) {
+                Some(t) => (floor_boundary(&t.text, c0), floor_boundary(&t.text, c1)),
+                None => continue,
+            };
+            if a >= b {
+                continue;
+            }
+            if !edited {
+                self.checkpoint(EditKind::Delete);
+                edited = true;
+            }
+            if let Some(t) = self.text_mut(u.id) {
+                t.replace(a..b, &RichText::default());
+            }
+        }
+        if edited {
+            self.normalize();
+        }
+        let col = self.text_of(s.block).map_or(0, |t| floor_boundary(&t.text, c0));
+        self.sel = Selection::caret(Pos::new(s.block, col));
+        self.fix_selection();
+    }
+
+    /// The Visual Block rectangle as plain text, one line per covered block.
+    pub fn columns_text(&self) -> String {
+        let units = self.units();
+        let (s, e) = self.ordered_in(&units);
+        let (Some(si), Some(ei)) = (self.unit_index(&units, s.block), self.unit_index(&units, e.block)) else { return String::new(); };
+        let (c0, c1) = (s.offset.min(e.offset), s.offset.max(e.offset));
+        units[si..=ei].iter().map(|u| match self.text_of(u.id) {
+            Some(t) if u.text => t.text[floor_boundary(&t.text, c0)..floor_boundary(&t.text, c1)].to_string(),
+            _ => String::new(),
+        }).collect::<Vec<_>>().join("\n")
+    }
+
+    /// Vim Visual Block paste: insert `lines[i]` at byte-column `col` into
+    /// the i-th text unit at and below the caret's block — the inverse of
+    /// `columns_text`/`delete_columns`, so a yanked rectangle pastes back as
+    /// one. A row past the last unit is skipped: nvim never creates new
+    /// lines for a block paste.
+    pub fn insert_columns(&mut self, lines: &[String], col: usize) {
+        if lines.is_empty() {
+            return;
+        }
+        let units = self.units();
+        let Some(start) = self.unit_index(&units, self.sel.head.block) else { return };
+        let mut edited = false;
+        for (i, line) in lines.iter().enumerate() {
+            let Some(u) = units.get(start + i) else { break };
+            if !u.text {
+                continue;
+            }
+            let Some(t) = self.text_of(u.id) else { continue };
+            let at = floor_boundary(&t.text, col.min(t.len()));
+            if !edited {
+                self.checkpoint(EditKind::Other);
+                edited = true;
+            }
+            if let Some(t) = self.text_mut(u.id) {
+                t.replace(at..at, &RichText::plain(line));
+            }
+        }
+        self.fix_selection();
     }
 
     /// Atomic blocks fully covered by the selection (rendered as selected).

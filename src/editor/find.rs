@@ -49,6 +49,7 @@ const BTN_W: f32 = 80.;
 
 impl Editor {
     pub fn open_find(&mut self, replace: bool, window: &mut Window, cx: &mut Context<Self>) {
+        self.vim_search_quiet = false;
         // Seed the query with a single-line selection, like the browser find bar.
         let (a, b) = self.core.ordered();
         if !self.core.in_block_mode() && a.block == b.block && a.offset < b.offset {
@@ -125,7 +126,7 @@ impl Editor {
             .collect()
     }
 
-    fn step_find(&mut self, forward: bool, window: &mut Window, cx: &mut Context<Self>) {
+    pub(super) fn step_find(&mut self, forward: bool, window: &mut Window, cx: &mut Context<Self>) {
         let Some(f) = &mut self.find else { return };
         let n = f.matches.len();
         if n == 0 {
@@ -170,6 +171,126 @@ impl Editor {
         cx.notify();
     }
 
+    /// `:s/old/new/[g]` and `:%s/old/new/[g]` — `whole_doc` is `%`, `global`
+    /// is the `g` flag (else only the first match per line/block). No
+    /// confirm (`c`) flag and no regex, like the ⌘F engine it reuses.
+    pub(super) fn vim_substitute(&mut self, whole_doc: bool, pat: &str, repl: &str, global: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let targets = self.vim_sub_targets(whole_doc);
+        let mut hits: Vec<(BlockId, Range<usize>)> = vec![];
+        for id in targets {
+            let Some(t) = self.core.text_of(id) else { continue };
+            let mut found = find_in(t, pat);
+            if !global {
+                found.truncate(1);
+            }
+            hits.extend(found.into_iter().map(|r| (id, r)));
+        }
+        if hits.is_empty() {
+            return;
+        }
+        self.core.checkpoint(EditKind::Other);
+        // Back to front so an earlier replacement in the same block never
+        // invalidates a later one's byte offsets.
+        for (id, r) in hits.into_iter().rev() {
+            self.replace_range(id, r, repl);
+        }
+        self.after_replace(window, cx);
+    }
+
+    /// `%s` targets every text block; a bare `s` targets only the caret's.
+    fn vim_sub_targets(&self, whole_doc: bool) -> Vec<BlockId> {
+        if whole_doc {
+            self.core.units().iter().filter(|u| u.text).map(|u| u.id).collect()
+        } else {
+            vec![self.core.sel.head.block]
+        }
+    }
+
+    /// Live-highlight a `:s`/`:%s` pattern while it's still being typed (no
+    /// second `/` yet) — the same target scope `vim_substitute` would use,
+    /// so what's highlighted matches what will actually be replaced.
+    pub(super) fn vim_sub_highlight_pattern(&mut self, whole_doc: bool, pat: &str, cx: &mut Context<Self>) {
+        if pat.is_empty() {
+            cx.notify();
+            return;
+        }
+        let mut matches = vec![];
+        for id in self.vim_sub_targets(whole_doc) {
+            if let Some(t) = self.core.text_of(id) {
+                matches.extend(find_in(t, pat).into_iter().map(|r| (id, r)));
+            }
+        }
+        self.vim_search_quiet = true;
+        self.find = Some(Find { replace: false, matches, current: None });
+        cx.notify();
+    }
+
+    /// The second `/` just appeared: freeze the pattern's matches (and each
+    /// touched block's pristine text) so later keystrokes only vary the
+    /// replacement, not what's being replaced.
+    pub(super) fn vim_sub_enter_replace(&mut self, whole_doc: bool, pat: &str, cx: &mut Context<Self>) {
+        let mut originals = vec![];
+        for id in self.vim_sub_targets(whole_doc) {
+            let Some(t) = self.core.text_of(id) else { continue };
+            let ranges = find_in(t, pat);
+            if !ranges.is_empty() {
+                originals.push((id, t.clone(), ranges));
+            }
+        }
+        self.vim_sub_preview = Some(super::view::VimSubPreview {
+            whole_doc,
+            pat: pat.to_string(),
+            originals,
+            was_dirty: self.core.dirty,
+        });
+        cx.notify();
+    }
+
+    /// Re-render the live preview for the replacement typed so far. Never
+    /// checkpoints: each keystroke restores every touched block to its
+    /// frozen pristine text, then re-applies the substitution fresh, so the
+    /// undo stack never sees the in-progress typing (only the final Submit,
+    /// via `vim_substitute`, does — see `close_vim_command`).
+    pub(super) fn vim_sub_update_preview(&mut self, repl: &str, global: bool, cx: &mut Context<Self>) {
+        let Some(preview) = &self.vim_sub_preview else { return };
+        let originals = preview.originals.clone();
+        for (id, original, ranges) in &originals {
+            if let Some(t) = self.core.text_mut(*id) {
+                *t = original.clone();
+            }
+            let mut apply = ranges.clone();
+            if !global {
+                apply.truncate(1);
+            }
+            for r in apply.into_iter().rev() {
+                self.replace_range(*id, r, repl);
+            }
+        }
+        // The caret's own offset is never touched by this preview; if the
+        // live replacement is shorter than the match, it can now sit past
+        // the end of its (shrunk) block — clamp it like any real edit would.
+        self.core.fix_selection();
+        self.core.generation += 1;
+        self.core.dirty = true;
+        cx.notify();
+    }
+
+    /// Undo a live preview without ever having touched the undo stack —
+    /// called whenever the bar closes (Escape, Submit, or the command no
+    /// longer parses as a substitute) so a cancelled preview leaves no trace.
+    pub(super) fn vim_sub_revert(&mut self, cx: &mut Context<Self>) {
+        let Some(preview) = self.vim_sub_preview.take() else { return };
+        for (id, original, _) in preview.originals {
+            if let Some(t) = self.core.text_mut(id) {
+                *t = original;
+            }
+        }
+        self.core.fix_selection();
+        self.core.generation += 1;
+        self.core.dirty = preview.was_dirty;
+        cx.notify();
+    }
+
     fn replace_one(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some((id, r)) = self.find.as_ref().and_then(|f| f.matches.get(f.current?).cloned()) else { return };
         let with = self.replace_field.read(cx).text.clone();
@@ -205,6 +326,21 @@ impl Editor {
 
     pub(super) fn on_find_event(&mut self, ev: &crate::input::TextFieldEvent, window: &mut Window, cx: &mut Context<Self>) {
         use crate::input::TextFieldEvent as E;
+        // Vim `/`/`?`: a different prompt (vim_open_search), different
+        // Submit/Cancel — confirm jumps once and closes; the regular find
+        // box keeps stepping/open until explicitly dismissed.
+        if self.vim_search_bar {
+            match ev {
+                E::Changed => {
+                    self.refresh_find(true, cx);
+                    cx.notify();
+                }
+                E::Submit => self.vim_search_confirm(window, cx),
+                E::Cancel => self.vim_search_cancel(window, cx),
+                _ => {}
+            }
+            return;
+        }
         match ev {
             E::Changed => {
                 self.refresh_find(true, cx);
@@ -219,6 +355,9 @@ impl Editor {
     }
 
     pub(super) fn find_box(&self, window: &Window, cx: &mut Context<Self>) -> Option<AnyElement> {
+        if self.vim_search_quiet {
+            return None;
+        }
         let f = self.find.as_ref()?;
         let n = f.matches.len();
         let counter = match f.current {

@@ -13,7 +13,33 @@ use unicode_segmentation::UnicodeSegmentation;
 
 actions!(
     field,
-    [Backspace, DeleteToHome, Delete, Left, Right, SelectLeft, SelectRight, WordLeft, WordRight, SelectWordLeft, SelectWordRight, Home, End, SelectAll, Copy, Cut, Paste, Submit, ShiftSubmit, Cancel, Up, Down, Swallow, Tab, ShiftTab]
+    [
+        Backspace,
+        DeleteToHome,
+        Delete,
+        Left,
+        Right,
+        SelectLeft,
+        SelectRight,
+        WordLeft,
+        WordRight,
+        SelectWordLeft,
+        SelectWordRight,
+        Home,
+        End,
+        SelectAll,
+        Copy,
+        Cut,
+        Paste,
+        Submit,
+        ShiftSubmit,
+        Cancel,
+        Up,
+        Down,
+        Swallow,
+        Tab,
+        ShiftTab
+    ]
 );
 
 pub fn bind_keys(cx: &mut App) {
@@ -170,7 +196,11 @@ impl TextField {
     }
 
     fn cursor(&self) -> usize {
-        if self.reversed { self.sel.start } else { self.sel.end }
+        if self.reversed {
+            self.sel.start
+        } else {
+            self.sel.end
+        }
     }
 
     fn move_to(&mut self, o: usize, cx: &mut Context<Self>) {
@@ -193,20 +223,33 @@ impl TextField {
     }
 
     fn prev(&self, o: usize) -> usize {
-        self.text.grapheme_indices(true).rev().find_map(|(i, _)| (i < o).then_some(i)).unwrap_or(0)
+        self.text
+            .grapheme_indices(true)
+            .rev()
+            .find_map(|(i, _)| (i < o).then_some(i))
+            .unwrap_or(0)
     }
 
     fn next(&self, o: usize) -> usize {
-        self.text.grapheme_indices(true).find_map(|(i, _)| (i > o).then_some(i)).unwrap_or(self.text.len())
+        self.text
+            .grapheme_indices(true)
+            .find_map(|(i, _)| (i > o).then_some(i))
+            .unwrap_or(self.text.len())
     }
 
     fn replace(&mut self, range: Range<usize>, s: &str, cx: &mut Context<Self>) {
-        let mut s = if self.multiline { s.replace("\r\n", "\n").replace('\r', "\n") } else { s.replace(['\n', '\r'], " ") };
+        let mut s = if self.multiline {
+            s.replace("\r\n", "\n").replace('\r', "\n")
+        } else {
+            s.replace(['\n', '\r'], " ")
+        };
         if self.digits {
             s.retain(|c| c.is_ascii_digit());
         }
         if let Some(max) = self.max_len {
-            let room = max.saturating_sub(self.text.chars().count() - self.text[range.clone()].chars().count());
+            let room = max.saturating_sub(
+                self.text.chars().count() - self.text[range.clone()].chars().count(),
+            );
             if let Some((cut, _)) = s.char_indices().nth(room) {
                 s.truncate(cut);
             }
@@ -253,7 +296,11 @@ impl TextField {
         if self.sel.is_empty() && self.cursor() == 0 {
             cx.emit(TextFieldEvent::LeftEdge);
         }
-        let o = if self.sel.is_empty() { self.prev(self.cursor()) } else { self.sel.start };
+        let o = if self.sel.is_empty() {
+            self.prev(self.cursor())
+        } else {
+            self.sel.start
+        };
         self.move_to(o, cx);
     }
 
@@ -261,7 +308,11 @@ impl TextField {
         if self.sel.is_empty() && self.cursor() == self.text.len() {
             cx.emit(TextFieldEvent::RightEdge);
         }
-        let o = if self.sel.is_empty() { self.next(self.cursor()) } else { self.sel.end };
+        let o = if self.sel.is_empty() {
+            self.next(self.cursor())
+        } else {
+            self.sel.end
+        };
         self.move_to(o, cx);
     }
 
@@ -276,12 +327,20 @@ impl TextField {
     }
 
     fn word_left(&mut self, _: &WordLeft, _: &mut Window, cx: &mut Context<Self>) {
-        let o = if self.sel.is_empty() { prev_word(&self.text, self.cursor()) } else { self.sel.start };
+        let o = if self.sel.is_empty() {
+            prev_word(&self.text, self.cursor())
+        } else {
+            self.sel.start
+        };
         self.move_to(o, cx);
     }
 
     fn word_right(&mut self, _: &WordRight, _: &mut Window, cx: &mut Context<Self>) {
-        let o = if self.sel.is_empty() { next_word(&self.text, self.cursor()) } else { self.sel.end };
+        let o = if self.sel.is_empty() {
+            next_word(&self.text, self.cursor())
+        } else {
+            self.sel.end
+        };
         self.move_to(o, cx);
     }
 
@@ -309,13 +368,17 @@ impl TextField {
 
     fn copy(&mut self, _: &Copy, _: &mut Window, cx: &mut Context<Self>) {
         if !self.sel.is_empty() {
-            cx.write_to_clipboard(ClipboardItem::new_string(self.text[self.sel.clone()].to_string()));
+            cx.write_to_clipboard(ClipboardItem::new_string(
+                self.text[self.sel.clone()].to_string(),
+            ));
         }
     }
 
     fn cut(&mut self, _: &Cut, _: &mut Window, cx: &mut Context<Self>) {
         if !self.sel.is_empty() {
-            cx.write_to_clipboard(ClipboardItem::new_string(self.text[self.sel.clone()].to_string()));
+            cx.write_to_clipboard(ClipboardItem::new_string(
+                self.text[self.sel.clone()].to_string(),
+            ));
             self.replace(self.sel.clone(), "", cx);
         }
     }
@@ -402,7 +465,12 @@ impl TextField {
     }
 
     fn index_for(&self, p: Point<Pixels>) -> usize {
-        self.cache.borrow().get(&self.id).map(|l| l.index_for(p)).unwrap_or(0).min(self.text.len())
+        self.cache
+            .borrow()
+            .get(&self.id)
+            .map(|l| l.index_for(p))
+            .unwrap_or(0)
+            .min(self.text.len())
     }
 
     fn on_down(&mut self, ev: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
@@ -413,7 +481,11 @@ impl TextField {
             return;
         }
         self.selecting = true;
-        if ev.modifiers.shift { self.select_to(i, cx) } else { self.move_to(i, cx) }
+        if ev.modifiers.shift {
+            self.select_to(i, cx)
+        } else {
+            self.move_to(i, cx)
+        }
     }
 
     fn on_move(&mut self, ev: &MouseMoveEvent, _: &mut Window, cx: &mut Context<Self>) {
@@ -465,8 +537,16 @@ impl EntityInputHandler for TextField {
         Some(self.text[r].to_string())
     }
 
-    fn selected_text_range(&mut self, _: bool, _: &mut Window, _: &mut Context<Self>) -> Option<UTF16Selection> {
-        Some(UTF16Selection { range: self.range16(&self.sel), reversed: self.reversed })
+    fn selected_text_range(
+        &mut self,
+        _: bool,
+        _: &mut Window,
+        _: &mut Context<Self>,
+    ) -> Option<UTF16Selection> {
+        Some(UTF16Selection {
+            range: self.range16(&self.sel),
+            reversed: self.reversed,
+        })
     }
 
     fn marked_text_range(&self, _: &mut Window, _: &mut Context<Self>) -> Option<Range<usize>> {
@@ -477,9 +557,18 @@ impl EntityInputHandler for TextField {
         self.marked = None;
     }
 
-    fn replace_text_in_range(&mut self, range: Option<Range<usize>>, s: &str, _: &mut Window, cx: &mut Context<Self>) {
+    fn replace_text_in_range(
+        &mut self,
+        range: Option<Range<usize>>,
+        s: &str,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         self.pointer_hidden = true;
-        let r = range.map(|r| self.range8(&r)).or(self.marked.clone()).unwrap_or(self.sel.clone());
+        let r = range
+            .map(|r| self.range8(&r))
+            .or(self.marked.clone())
+            .unwrap_or(self.sel.clone());
         self.marked = None;
         self.replace(r, s, cx);
     }
@@ -493,7 +582,10 @@ impl EntityInputHandler for TextField {
         cx: &mut Context<Self>,
     ) {
         self.pointer_hidden = true;
-        let r = range.map(|r| self.range8(&r)).or(self.marked.clone()).unwrap_or(self.sel.clone());
+        let r = range
+            .map(|r| self.range8(&r))
+            .or(self.marked.clone())
+            .unwrap_or(self.sel.clone());
         self.text.replace_range(r.clone(), s);
         self.marked = (!s.is_empty()).then(|| r.start..r.start + s.len());
         let sel = new_sel
@@ -523,7 +615,12 @@ impl EntityInputHandler for TextField {
         Some(Bounds::from_corners(a, point(b.x, b.y + l.line_height)))
     }
 
-    fn character_index_for_point(&mut self, p: Point<Pixels>, _: &mut Window, _: &mut Context<Self>) -> Option<usize> {
+    fn character_index_for_point(
+        &mut self,
+        p: Point<Pixels>,
+        _: &mut Window,
+        _: &mut Context<Self>,
+    ) -> Option<usize> {
         Some(self.to16(self.index_for(p)))
     }
 }
@@ -553,6 +650,7 @@ impl Render for TextField {
             marked: self.marked.clone(),
             cache: self.cache.clone(),
             show_caret: focused && !self.hide_caret && self.sel.is_empty(),
+            block_caret: false,
             highlight: None,
             found: vec![],
             eq_counter: 0,
@@ -606,7 +704,11 @@ impl Render for TextField {
                 canvas(
                     |_, _, _| (),
                     move |bounds, _, window, cx| {
-                        window.handle_input(&focus, ElementInputHandler::new(bounds, entity.clone()), cx);
+                        window.handle_input(
+                            &focus,
+                            ElementInputHandler::new(bounds, entity.clone()),
+                            cx,
+                        );
                         if pointer_hidden {
                             window.set_window_cursor_style(CursorStyle::None);
                             let e = entity.clone();
